@@ -3,6 +3,8 @@
 // Simulate: 16 players (include requester), requester chooses via DM, bots auto
 // Full Placement (Position Matches) for 1–16 in simulate mode
 // Group name always included in DM to avoid confusion
+// Flex Leaderboard 1–16 + Flex Bracket Overview
+// Robust DM delivery with pending queue + 'janken dm' to flush
 
 import 'dotenv/config';
 import express from 'express';
@@ -39,8 +41,9 @@ const HANDS = ['rock','paper','scissors'];
 const EMOJI = { rock:'✊', paper:'✋', scissors:'✌️' };
 const POOLS = ['A','B','C','D'];
 
-const rooms = new Map();  // groupId -> room
-const groupNameCache = new Map(); // groupId -> name
+const rooms = new Map();           // groupId -> room
+const groupNameCache = new Map();  // groupId -> name
+const pendingDMs = new Map();      // userId -> Array<messages[]> (queued payloads)
 
 const nowTH = () => new Date().toLocaleString('th-TH', { hour12:false });
 const shuffle = a => { const x=[...a]; for(let i=x.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1)); [x[i],x[j]]=[x[j],x[i]];} return x; };
@@ -78,9 +81,38 @@ async function groupName(gid){
   return '(กลุ่มของคุณ)';
 }
 
-async function safePush(to, msgs){ try{ await client.pushMessage(to, Array.isArray(msgs)?msgs:[msgs]); }catch(e){ console.warn('push fail', e?.response?.data || e?.message); } }
+async function safePush(to, msgs){ try{ await client.pushMessage(to, Array.isArray(msgs)?msgs:[msgs]); }catch(e){ console.warn('push fail', e?.response?.data || e?.message); throw e; } }
 async function safeReply(token, msgs){ try{ await client.replyMessage(token, Array.isArray(msgs)?msgs:[msgs]); }catch(e){ console.warn('reply fail', e?.response?.data || e?.message); } }
 
+/* ====== Robust DM delivery with pending queue ====== */
+function queueDM(uid, payloads){
+  const q = pendingDMs.get(uid) || [];
+  q.push(payloads);
+  pendingDMs.set(uid, q);
+}
+async function pushDM(uid, payloads, gid, room){
+  try{
+    await safePush(uid, payloads);
+  }catch(e){
+    // แจ้งเตือนในกลุ่มและคิว DM ไว้ให้ผู้เล่นมากดรับเองด้วย "janken dm" ที่ 1:1
+    queueDM(uid, payloads);
+    let name = '(ผู้เล่น)';
+    try{
+      if (room && room.players.has(uid)) name = room.players.get(uid).name || name;
+      else {
+        const p = await client.getGroupMemberProfile(gid, uid);
+        name = p?.displayName || name;
+      }
+    }catch{}
+    const gName = await groupName(gid);
+    await safePush(gid, {
+      type:'text',
+      text:`📣 แจ้งเตือน: ${name}\nยังส่งปุ่มเลือกหมัดใน DM ไม่ได้\nโปรดเปิดแชท 1:1 กับบอท แล้วพิมพ์ "janken dm" เพื่อรับปุ่มอีกครั้ง (กลุ่ม “${gName}”)`
+    });
+  }
+}
+
+/* ========== ROOM INIT ========== */
 function ensureRoom(gid){
   if (!rooms.has(gid)) {
     rooms.set(gid, {
@@ -90,13 +122,12 @@ function ensureRoom(gid){
       players:new Map(),       // userId -> {name}
       bracket:{
         round:0,
-        pools:{A:[],B:[],C:[],D:[]}, // match: {a,b,state:'pending'|'done',moves:{},winner,loser}
+        pools:{A:[],B:[],C:[],D:[]},
         waitingOdd:null,
         cross:[],
-        sim:[]                 // current stage matches in simulate
+        sim:[]
       },
-      // --- simulate controller ---
-      simCtx: { key:'', title:'', queue:[], result:{}, tmp:{} }, // queue of stages, final ranks in result
+      simCtx: { key:'', title:'', queue:[], result:{}, tmp:{} },
     });
   }
   return rooms.get(gid);
@@ -171,20 +202,101 @@ async function tryPushFlexOrText(to, title, lines){
       const head = chunks.length>1 ? `${title} (หน้า ${i+1}/${chunks.length})` : title;
       await client.pushMessage(to, [buildFlexRoundPairs(head, chunks[i])]);
     }
-  }catch(e){
+  }catch{
     await safePush(to, { type:'text', text:[title, ...lines].join('\n') });
   }
 }
 
-/* ====== DM buttons with POSTBACK (SAFE for multi-group) ====== */
+/* ====== Flex Bracket Overview (สวย ๆ 2 คอลัมน์) ====== */
+function bracketPairsToColumns(pairs, room){
+  const items = pairs.map(([a,b], i)=>({
+    type:'box', layout:'horizontal', spacing:'sm', contents:[
+      { type:'text', text:`${i+1}.`, size:'xs', color:'#90CAF9', flex:1, align:'end' },
+      { type:'text', text:pretty(room,a), size:'sm', flex:6, wrap:true },
+      { type:'text', text:'vs', size:'xs', color:'#9E9E9E', align:'center', flex:2 },
+      { type:'text', text:pretty(room,b), size:'sm', flex:6, wrap:true }
+    ]
+  }));
+  const half = Math.ceil(items.length/2);
+  return [ items.slice(0,half), items.slice(half) ];
+}
+function bracketOverviewFlex(title, pairs, room){
+  const [left, right] = bracketPairsToColumns(pairs, room);
+  return {
+    type:'flex', altText:title,
+    contents:{
+      type:'bubble',
+      header:{ type:'box', layout:'vertical', contents:[
+        { type:'text', text:title, weight:'bold', size:'lg' },
+        { type:'text', text: nowTH(), size:'xxs', color:'#999' },
+      ]},
+      body:{ type:'box', layout:'vertical', spacing:'md', contents:[
+        {
+          type:'box', layout:'horizontal', spacing:'md', contents:[
+            { type:'box', layout:'vertical', spacing:'xs', width:'50%', contents:left },
+            { type:'box', layout:'vertical', spacing:'xs', width:'50%', contents:right }
+          ]
+        }
+      ]}
+    }
+  };
+}
+
+/* ====== Flex Leaderboard 1–16 ====== */
+function colorByRank(rank){
+  if (rank===1) return '#FFD54F';
+  if (rank===2) return '#E0E0E0';
+  if (rank===3) return '#D4AF37';
+  return '#FFFFFF';
+}
+function rowEntry(rank, name){
+  const color = colorByRank(rank);
+  return {
+    type:'box', layout:'baseline', spacing:'sm',
+    contents:[
+      { type:'text', text:String(rank).padStart(2,' '), weight:'bold', size:'sm', color:'#90CAF9', flex:1, align:'end' },
+      { type:'text', text:name, size:'sm', wrap:true, color:'#212121', flex:7 }
+    ],
+    backgroundColor: rank<=3 ? color+'1F' : undefined,
+    cornerRadius: rank<=3 ? 'md' : undefined,
+    paddingAll: rank<=3 ? '6px' : undefined
+  };
+}
+function leaderboardFlex16(gName, ordered){
+  const left = ordered.slice(0,8).map(x=>rowEntry(x.rank, x.name));
+  const right= ordered.slice(8,16).map(x=>rowEntry(x.rank, x.name));
+  return {
+    type:'flex',
+    altText:`ผลจัดอันดับ 1–16 — ${gName}`,
+    contents:{
+      type:'bubble',
+      header:{ type:'box', layout:'vertical', contents:[
+        { type:'text', text:'📊 FINAL STANDINGS', weight:'bold', size:'lg', color:'#FFFFFF' },
+        { type:'text', text:`${gName}`, size:'xs', color:'#E0E0E0' },
+        { type:'text', text:nowTH(), size:'xxs', color:'#BDBDBD' }
+      ], backgroundColor:'#121212', paddingAll:'16px' },
+      body:{ type:'box', layout:'vertical', spacing:'md', contents:[
+        {
+          type:'box', layout:'horizontal', spacing:'md', contents:[
+            { type:'box', layout:'vertical', spacing:'xs', width:'50%', contents:left },
+            { type:'box', layout:'vertical', spacing:'xs', width:'50%', contents:right }
+          ]
+        },
+        { type:'separator' },
+        { type:'text', text:'Top 3 Highlighted • Janken Tournament', size:'xs', color:'#9E9E9E', align:'center' }
+      ]},
+      styles:{ body:{ backgroundColor:'#FAFAFA' } }
+    }
+  };
+}
+
+/* ====== DM Postback helpers ====== */
 const matchKey = (gid, stage, pool, idx) => `${gid}|${stage}|${pool ?? '-' }|${idx}`;
 const makePostback = (gid, stage, pool, idx, hand) =>
   ({ type:'postback', label:`${EMOJI[hand]} ${hand.toUpperCase()}`, data:`jg|${matchKey(gid,stage,pool,idx)}|${hand}`, displayText:hand });
-
 const qrPostback = (gid, stage, pool, idx) => ({
   items: HANDS.map(h => ({ type:'action', action: makePostback(gid,stage,pool,idx,h) }))
 });
-
 function choiceFlexPostback(title, gid, stage, pool, idx) {
   return {
     type:'flex', altText:title,
@@ -214,6 +326,7 @@ function seedPoolsFrom(ids){
 const allPoolsDone = pools => POOLS.every(k => pools[k].every(m => m.state==='done'));
 const poolWinners = pools => POOLS.reduce((acc,k)=> (acc[k] = pools[k].map(m=>m.winner).filter(Boolean), acc), {});
 
+/* ========== Announce helpers (NORMAL) ========== */
 async function announcePoolsRound(gid, room, title){
   const lines=[];
   for (const k of POOLS) {
@@ -223,15 +336,20 @@ async function announcePoolsRound(gid, room, title){
   }
   await tryPushFlexOrText(gid, title, lines);
 
+  // Bracket overview (สวย ๆ)
+  const pairs = POOLS.flatMap(k => room.bracket.pools[k].map(m=>[m.a,m.b]));
+  try{ await client.pushMessage(gid, [ bracketOverviewFlex(`${title} • Overview`, pairs, room) ]); }catch{}
+
   const gName = await groupName(gid);
   for (const k of POOLS) {
     room.bracket.pools[k].forEach(async (m, i) => {
       for (const uid of [m.a, m.b]) if (uid) {
-        await safePush(uid, [
+        const payloads = [
           { type:'text', text:`📝 รอบสาย ${k} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'pools', k, i) },
           choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'pools', k, i),
           { type:'text', text:`เลือกแล้วรอลุ้นผลในกลุ่ม “${gName}” ได้เลย!` }
-        ]);
+        ];
+        await pushDM(uid, payloads, gid, room);
       }
     });
   }
@@ -241,14 +359,20 @@ async function announceCrossRound(gid, room, title){
   const lines = room.bracket.cross.map((m,i)=>`Match ${i+1}: ${pretty(room,m.a)} vs ${pretty(room,m.b)}`);
   await tryPushFlexOrText(gid, title, lines);
 
+  // Bracket overview
+  const pairs = room.bracket.cross.map(m=>[m.a,m.b]);
+  try{ await client.pushMessage(gid, [ bracketOverviewFlex(`${title} • Overview`, pairs, room) ]); }catch{}
+
   const gName = await groupName(gid);
-  for (const m of room.bracket.cross) for (const uid of [m.a,m.b]) if (uid){
-    const idx = room.bracket.cross.indexOf(m);
-    await safePush(uid, [
-      { type:'text', text:`📝 ${title} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'cross', null, idx) },
-      choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'cross', null, idx),
-      { type:'text', text:`เลือกเสร็จ รอประกาศผลในกลุ่ม “${gName}” เลย!` }
-    ]);
+  for (const [i, m] of room.bracket.cross.entries()){
+    for (const uid of [m.a,m.b]) if (uid){
+      const payloads = [
+        { type:'text', text:`📝 ${title} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'cross', null, i) },
+        choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'cross', null, i),
+        { type:'text', text:`เลือกเสร็จ รอประกาศผลในกลุ่ม “${gName}” เลย!` }
+      ];
+      await pushDM(uid, payloads, gid, room);
+    }
   }
 }
 
@@ -287,29 +411,38 @@ function enqueueStage(room, key, title, idList){
 async function startNextSimStage(gid, room){
   const stage = room.simCtx.queue.shift();
   if (!stage){
-    // If all ranks assigned, announce
-    const ranks = room.simCtx.result; // uid->rank
+    const ranks = room.simCtx.result;
+    const gName = await groupName(gid);
     if (Object.keys(ranks).length === 16) {
-      const ordered = Object.entries(ranks).sort((a,b)=>a[1]-b[1]);
-      const lines = ordered.map(([uid,rank])=>`${rank}) ${pretty(room, uid)}`);
-      await safePush(gid, { type:'text', text:`📊 ผลจัดอันดับครบ 1–16 (Simulation)\n\n${lines.join('\n')}` });
+      const ordered = Object.entries(ranks)
+        .map(([uid,rank])=>({ uid, rank, name: pretty(room, uid) }))
+        .sort((a,b)=>a.rank-b.rank);
+      try {
+        await client.pushMessage(gid, [ leaderboardFlex16(gName, ordered) ]);
+      } catch {
+        const lines = ordered.map(x=>`${x.rank}) ${x.name}`);
+        await safePush(gid, { type:'text', text:`📊 ผลจัดอันดับครบ 1–16 (Simulation)\n\n${lines.join('\n')}` });
+      }
     } else {
       await safePush(gid, { type:'text', text:`🏁 จำลองสิ้นสุด` });
     }
-    // finish
     room.phase='finished'; room.stage='finished';
     return;
   }
   room.simCtx.key = stage.key;
   room.simCtx.title = stage.title;
   room.bracket.sim = makeMatchesFromPairs(stage.pairs);
+
+  // ส่งภาพรวม Bracket ของสเตจนี้ด้วย
+  try{ await client.pushMessage(gid, [ bracketOverviewFlex(stage.title+' • Overview', stage.pairs, room) ]); }catch{}
+
   await announceSimRound(gid, room, stage.title);
 }
 
 /* ========== EVENT HANDLER ========== */
 async function handleEvent(e){
 
-  /* --- POSTBACK จาก DM (เลือกหมัดพร้อมป้องกันเล่นหลายกลุ่ม) --- */
+  /* --- POSTBACK จาก DM (เลือกหมัด) --- */
   if (e.type === 'postback' && typeof e.postback?.data === 'string') {
     const data = e.postback.data.split('|'); // jg|<gid>|<stage>|<pool>|<idx>|<hand>
     if (data[0] === 'jg') {
@@ -350,10 +483,29 @@ async function handleEvent(e){
     return;
   }
 
-  /* --- ข้อความใน DM (fallback: ให้กดปุ่ม postback) --- */
+  /* --- ข้อความใน DM (ผู้ใช้ 1:1) --- */
   if (e.type==='message' && e.message.type==='text' && e.source.type==='user') {
     const t = (e.message.text||'').trim().toLowerCase();
-    if (!HANDS.includes(t)) {
+
+    if (t === 'janken dm' || t === 'dm' || t === 'open dm') {
+      const uid = e.source.userId;
+      const q = pendingDMs.get(uid) || [];
+      if (!q.length) {
+        await safeReply(e.replyToken, { type:'text', text:'ยังไม่มีข้อความค้างส่งครับ หากคุณกำลังแข่งอยู่ รอระบบส่งอีกครั้งได้เลย' });
+      } else {
+        // ส่งทั้งหมดที่ค้าง
+        for (const payloads of q) {
+          try{ await client.replyMessage(e.replyToken, payloads); }
+          catch{ try{ await client.pushMessage(uid, payloads);}catch{} }
+        }
+        pendingDMs.delete(uid);
+      }
+      return;
+    }
+
+    // พิมพ์ rock/paper/scissors -> แจ้งให้ใช้ปุ่ม
+    const isHand = HANDS.includes(t);
+    if (!isHand) {
       await safeReply(e.replyToken, [
         { type:'text', text:'แตะปุ่มเพื่อเลือกหมัดได้เลย (หรือพิมพ์ rock / paper / scissors)' }
       ]);
@@ -448,20 +600,15 @@ async function handleEvent(e){
       break;
     }
 
-    /* ===== SIMULATE: 16 ผู้เล่น รวมคุณ และคุณเลือกหมัดใน DM ได้ + Placement 1–16 ===== */
     case 'simulate': {
       if (room.admin && room.admin !== e.source.userId) {
         await safeReply(e.replyToken, { type:'text', text:'❌ เฉพาะผู้สร้างเท่านั้นที่สามารถสั่ง simulate ได้' });
         break;
       }
 
-      // ผู้สั่งเป็นผู้เล่นจริงเสมอ
       const requesterId = e.source.userId;
       let requesterName = 'You';
-      try {
-        const p = await client.getGroupMemberProfile(gid, requesterId);
-        requesterName = p?.displayName || 'You';
-      } catch {}
+      try { const p = await client.getGroupMemberProfile(gid, requesterId); requesterName = p?.displayName || 'You'; } catch {}
 
       room.admin = requesterId;
       room.phase = 'playing';
@@ -469,7 +616,6 @@ async function handleEvent(e){
       room.bracket.round = 1;
       room.simCtx = { key:'', title:'', queue:[], result:{}, tmp:{} };
 
-      // รวมผู้ที่ join + requester และเติม mock ให้ครบ 16
       const realEntries = new Map(room.players);
       realEntries.set(requesterId, { name: requesterName });
 
@@ -481,20 +627,16 @@ async function handleEvent(e){
       const selected = [requesterId, ...shuffledOthers].slice(0, MAX);
       while (selected.length < MAX) selected.push(`mock_${selected.length}`);
 
-      // ตั้งชื่อผู้เล่น
       const playersMap = new Map();
-      for (const uid of selected) {
-        if (realEntries.has(uid)) playersMap.set(uid, { name: realEntries.get(uid).name });
-      }
+      for (const uid of selected) if (realEntries.has(uid)) playersMap.set(uid, { name: realEntries.get(uid).name });
       let mockNo = 1;
       for (const uid of selected) if (!playersMap.has(uid)) playersMap.set(uid, { name:`Player${mockNo++}` });
       room.players = playersMap;
 
       await safePush(gid, { type:'text',
-        text:`🧪 เริ่มจำลอง (Placement ครบ 1–16) — ผู้เล่น ${room.players.size} คน (กลุ่ม “${gName}”)\n- คุณจะเลือกหมัดใน DM ได้จริง\n- ผู้เล่น mock จะออกรอบอัตโนมัติ`
+        text:`🧪 เริ่มจำลอง (Placement ครบ 1–16) — ผู้เล่น ${room.players.size} คน (กลุ่ม “${gName}”)\n- คุณจะเลือกหมัดใน DM ได้จริง\n- ผู้เล่น mock จะออกรอบอัตโนมัติ\nหากใครไม่ได้รับ DM ให้ไปคุย 1:1 กับบอทแล้วพิมพ์ "janken dm"`
       });
 
-      // Enqueue สเตจทั้งหมดแบบ dynamic เริ่มจาก R16
       enqueueStage(room, 'R16', '📣 รอบ 16 ทีม (Main Bracket)', selected);
       await startNextSimStage(gid, room);
       break;
@@ -522,10 +664,13 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
     if (r==='DRAW'){
       m.moves={};
       const gName = await groupName(gid);
-      for (const uid of [m.a,m.b]) if (uid) await safePush(uid, [
-        {type:'text', text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'pools',k,idx)},
-        choiceFlexPostback('เลือกใหม่อีกครั้ง', gid, 'pools', k, idx)
-      ]);
+      for (const uid of [m.a,m.b]) if (uid) {
+        const payloads = [
+          {type:'text', text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'pools',k,idx)},
+          choiceFlexPostback('เลือกใหม่อีกครั้ง', gid, 'pools', k, idx)
+        ];
+        await pushDM(uid, payloads, gid, room);
+      }
       return;
     }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
@@ -542,7 +687,6 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
   const lines=[]; for (const kk of POOLS) if (winners[kk].length) lines.push(`สาย ${kk}: ${winners[kk].map(u=>pretty(room,u)).join(', ')}`);
   await tryPushFlexOrText(gid, 'สรุปผลรอบนี้', lines);
 
-  // กรณีมีคนค้าง odd ในรอบแรก
   if (room.bracket.round===1 && room.bracket.waitingOdd){
     const flat = Object.values(winners).flat();
     if (flat.length){
@@ -555,7 +699,6 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
     }
   }
 
-  // ถ้าในสายยังเหลือมากกว่า 1 ให้จับคู่ต่อในสาย
   const eachPoolSingle = POOLS.every(kk => winners[kk].length<=1);
   if (!eachPoolSingle){
     const next={A:[],B:[],C:[],D:[]};
@@ -569,7 +712,6 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
     return;
   }
 
-  // ข้ามสาย (cross)
   const champs = Object.values(winners).flat();
   if (champs.length === 1){
     await safePush(gid, { type:'text', text:`🏆 แชมป์: ${pretty(room,champs[0])}` });
@@ -597,10 +739,13 @@ async function tryCloseMatch_Cross(gid, room, idx){
     if (r==='DRAW'){
       m.moves={};
       const gName = await groupName(gid);
-      for (const uid of [m.a,m.b]) if (uid) await safePush(uid, [
-        {type:'text', text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'cross',null,idx)},
-        choiceFlexPostback('เลือกใหม่อีกครั้ง', gid, 'cross', null, idx)
-      ]);
+      for (const uid of [m.a,m.b]) if (uid) {
+        const payloads = [
+          {type:'text', text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'cross',null,idx)},
+          choiceFlexPostback('เลือกใหม่อีกครั้ง', gid, 'cross', null, idx)
+        ];
+        await pushDM(uid, payloads, gid, room);
+      }
       return;
     }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
@@ -627,7 +772,7 @@ async function tryCloseMatch_Cross(gid, room, idx){
   await announceCrossRound(gid, room, `🏁 รอบรวม (รอบที่ ${room.bracket.round})`);
 }
 
-/* ========== SIMULATE (เลือกจริงใน DM + mock ออโต้) ========== */
+/* ========== SIMULATE (ประกาศ + ปิดแมตช์) ========== */
 async function announceSimRound(gid, room, title){
   const lines = room.bracket.sim.map((m,i)=>`Match ${i+1}: ${pretty(room,m.a)} vs ${pretty(room,m.b)}`);
   await tryPushFlexOrText(gid, title, lines);
@@ -643,11 +788,12 @@ async function announceSimRound(gid, room, title){
       if (isMock(uid)) {
         m.moves[uid] = randomHand();
       } else {
-        await safePush(uid, [
+        const payloads = [
           { type:'text', text:`📝 รอบจำลองในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'sim', null, i) },
           choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'sim', null, i),
           { type:'text', text:`เลือกเสร็จ รอประกาศผลในกลุ่ม “${gName}” เลย!` }
-        ]);
+        ];
+        await pushDM(uid, payloads, gid, room);
       }
     }
 
@@ -693,49 +839,41 @@ async function tryCloseMatch_Sim(gid, room, idx){
     return; // ยังรอผู้เล่นจริงเลือกหมัด
   }
 
-  // ถ้าทุกแมตช์ในรอบปิดครบ -> วางสเตจถัดไป/บันทึกอันดับ
   const allDone = room.bracket.sim.every(x=>x.state==='done');
   if (!allDone) return;
 
   const winners = room.bracket.sim.map(x=>x.winner).filter(Boolean);
   const losers  = room.bracket.sim.map(x=>x.loser ).filter(Boolean);
 
-  // วางต่อจากคีย์สเตจปัจจุบัน
   const key = room.simCtx.key;
   const res = room.simCtx.result;
   switch (key) {
     case 'R16': {
-      // winners -> QF, losers -> 9–16 R1
       enqueueStage(room, 'QF', '📣 รอบ 8 ทีม (Quarterfinals)', winners);
       enqueueStage(room, 'PL_9_16_R1', '🎖 จัดอันดับ 9–16 (รอบแรก)', losers);
       break;
     }
     case 'QF': {
-      // winners -> SF, losers -> 5–8 R1
       enqueueStage(room, 'SF', '📣 รอบรองชนะเลิศ (Semifinals)', winners);
       enqueueStage(room, 'PL_5_8_R1', '🏅 จัดอันดับ 5–8 (รอบแรก)', losers);
       break;
     }
     case 'SF': {
-      // winners -> FINAL, losers -> BRONZE
       enqueueStage(room, 'FINAL',  '🏆 ชิงชนะเลิศ (Final)', winners);
       enqueueStage(room, 'BRONZE', '🥉 ชิงอันดับ 3–4 (Bronze)', losers);
       break;
     }
     case 'FINAL': {
-      // winner=1, loser=2
       if (winners[0]) res[winners[0]] = 1;
       if (losers[0])  res[losers[0]]  = 2;
       break;
     }
     case 'BRONZE': {
-      // winner=3, loser=4
       if (winners[0]) res[winners[0]] = 3;
       if (losers[0])  res[losers[0]]  = 4;
       break;
     }
     case 'PL_5_8_R1': {
-      // winners -> 5/6 Final, losers -> 7/8 Final
       enqueueStage(room, 'PL_5_6_FINAL', '🏅 ชิงอันดับ 5–6', winners);
       enqueueStage(room, 'PL_7_8_FINAL', '🏅 ชิงอันดับ 7–8', losers);
       break;
@@ -751,19 +889,16 @@ async function tryCloseMatch_Sim(gid, room, idx){
       break;
     }
     case 'PL_9_16_R1': {
-      // winners -> 9–12 SF, losers -> 13–16 SF
       enqueueStage(room, 'PL_9_12_SF',  '🎖 จัดอันดับ 9–12 (รองรองชนะเลิศ)', winners);
       enqueueStage(room, 'PL_13_16_SF', '🎖 จัดอันดับ 13–16 (รองรองชนะเลิศ)', losers);
       break;
     }
     case 'PL_9_12_SF': {
-      // winners -> 9/10 Final, losers -> 11/12 Final
       enqueueStage(room, 'PL_9_10_FINAL',  '🎖 ชิงอันดับ 9–10', winners);
       enqueueStage(room, 'PL_11_12_FINAL', '🎖 ชิงอันดับ 11–12', losers);
       break;
     }
     case 'PL_13_16_SF': {
-      // winners -> 13/14 Final, losers -> 15/16 Final
       enqueueStage(room, 'PL_13_14_FINAL', '🎖 ชิงอันดับ 13–14', winners);
       enqueueStage(room, 'PL_15_16_FINAL', '🎖 ชิงอันดับ 15–16', losers);
       break;
@@ -790,11 +925,5 @@ async function tryCloseMatch_Sim(gid, room, idx){
     }
   }
 
-  // ถ้ายังไม่ครบ 16 อันดับ → ไปสเตจถัดไป
-  if (Object.keys(room.simCtx.result).length < 16) {
-    await startNextSimStage(gid, room);
-  } else {
-    // ครบแล้วก็สรุปใน startNextSimStage เมื่อ queue หมด
-    await startNextSimStage(gid, room);
-  }
+  await startNextSimStage(gid, room);
 }
