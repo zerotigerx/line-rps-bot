@@ -1,6 +1,8 @@
-// Janken Tournament — Multi-Room Safe (postback payload) + Group name in DM
-// Limit 20 players / tournament. Pools A–D -> winners cross bracket.
-// Includes Flex menus, Quick Reply + Flex buttons in DM, Flex fallback to text.
+// Janken Tournament — Multi-Room Safe with Flex + Postback + DM compliments
+// Normal: max 20 players; Pools A–D -> cross bracket
+// Simulate: 16 players (include requester), requester chooses via DM, bots auto
+// Full Placement (Position Matches) for 1–16 in simulate mode
+// Group name always included in DM to avoid confusion
 
 import 'dotenv/config';
 import express from 'express';
@@ -32,7 +34,7 @@ app.post('/webhook', middleware(config), async (req, res) => {
   }
 });
 
-/* ========== STATE ========== */
+/* ========== STATE / UTILS ========== */
 const HANDS = ['rock','paper','scissors'];
 const EMOJI = { rock:'✊', paper:'✋', scissors:'✌️' };
 const POOLS = ['A','B','C','D'];
@@ -44,6 +46,28 @@ const nowTH = () => new Date().toLocaleString('th-TH', { hour12:false });
 const shuffle = a => { const x=[...a]; for(let i=x.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1)); [x[i],x[j]]=[x[j],x[i]];} return x; };
 const pretty = (room,uid)=> uid ? (room.players.get(uid)?.name || '(?)') : '— Bye —';
 const judge = (a,b)=>{ if(!a||!b) return a? 'A':'B'; if(a===b) return 'DRAW'; const beats={rock:'scissors',paper:'rock',scissors:'paper'}; return beats[a]===b?'A':'B'; };
+
+// --- simulate helpers ---
+const isMock = uid => typeof uid === 'string' && uid.startsWith('mock_');
+const randomHand = () => HANDS[Math.floor(Math.random() * HANDS.length)];
+
+/* ===== คำชม/แซวแบบสุ่มใน DM หลังผู้เล่นเลือกหมัด ===== */
+const complimentPhrases = (hand, gName) => {
+  const e = EMOJI[hand] || '';
+  const H = hand.toUpperCase();
+  return [
+    `เลือกได้คมมาก! ${H} ${e} ดูทรงแล้วมีลุ้นนะ ในกลุ่ม “${gName}” 🔥`,
+    `เยี่ยม! ${H} ${e} เหมาะกับสายตาแชมป์สุด ๆ รอประกาศผลใน “${gName}” เลย 👑`,
+    `โอ้โห จังหวะนี้ต้อง ${H} ${e} เท่านั้น! ไปลุ้นกันต่อใน “${gName}” 🎯`,
+    `แผนดี! ${H} ${e} กำลังจะพลิกเกมแน่นอน รอดูผลใน “${gName}” 🃏`,
+    `เห็นหมัดนี้แล้วใจสั่น ${H} ${e} รอคู่แข่งเลือก แล้วไปลุ้นใน “${gName}” 🎲`,
+    `เซンスนักแข่งชัด ๆ — ${H} ${e} ลุ้นต่อใน “${gName}” เลย! 🚀`,
+  ];
+};
+const pickCompliment = (hand, gName) => {
+  const arr = complimentPhrases(hand, gName);
+  return arr[Math.floor(Math.random()*arr.length)];
+};
 
 async function groupName(gid){
   if (groupNameCache.has(gid)) return groupNameCache.get(gid);
@@ -62,14 +86,17 @@ function ensureRoom(gid){
     rooms.set(gid, {
       admin:null,
       phase:'idle',            // idle | register | playing | finished
-      stage:'pools',           // pools | cross | finished
+      stage:'pools',           // pools | cross | sim | finished
       players:new Map(),       // userId -> {name}
       bracket:{
         round:0,
         pools:{A:[],B:[],C:[],D:[]}, // match: {a,b,state:'pending'|'done',moves:{},winner,loser}
         waitingOdd:null,
-        cross:[]
-      }
+        cross:[],
+        sim:[]                 // current stage matches in simulate
+      },
+      // --- simulate controller ---
+      simCtx: { key:'', title:'', queue:[], result:{}, tmp:{} }, // queue of stages, final ranks in result
     });
   }
   return rooms.get(gid);
@@ -89,6 +116,9 @@ function menuFlex(){
         { type:'button', style:'secondary', action:{ type:'message', label:'Close',  text:'janken close' } },
         { type:'button', style:'secondary', action:{ type:'message', label:'Status', text:'janken status' } },
         { type:'button', style:'secondary', action:{ type:'message', label:'Reset',  text:'janken reset' } },
+        { type:'separator' },
+        { type:'text', text:'สำหรับทดสอบ', size:'xs', color:'#999' },
+        { type:'button', style:'secondary', action:{ type:'message', label:'Simulate (16 with placement)', text:'janken simulate' } },
       ]}
     }
   };
@@ -173,7 +203,7 @@ function choiceFlexPostback(title, gid, stage, pool, idx) {
   };
 }
 
-/* ========== SEEDING & ANNOUNCE ========== */
+/* ========== SEEDING & ANNOUNCE (NORMAL) ========== */
 const toPairs = ids => { const out=[]; for(let i=0;i<ids.length;i+=2) out.push([ids[i]||null, ids[i+1]||null]); return out; };
 function seedPoolsFrom(ids){
   const pools={A:[],B:[],C:[],D:[]}, shuffled=shuffle(ids); let i=0;
@@ -193,7 +223,6 @@ async function announcePoolsRound(gid, room, title){
   }
   await tryPushFlexOrText(gid, title, lines);
 
-  // DM ปุ่มเลือกหมัด + บอกชื่อกลุ่ม
   const gName = await groupName(gid);
   for (const k of POOLS) {
     room.bracket.pools[k].forEach(async (m, i) => {
@@ -201,7 +230,7 @@ async function announcePoolsRound(gid, room, title){
         await safePush(uid, [
           { type:'text', text:`📝 รอบสาย ${k} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'pools', k, i) },
           choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'pools', k, i),
-          { type:'text', text:`เมื่อเลือกแล้ว รอลุ้นผลในกลุ่ม “${gName}” ได้เลย!` }
+          { type:'text', text:`เลือกแล้วรอลุ้นผลในกลุ่ม “${gName}” ได้เลย!` }
         ]);
       }
     });
@@ -214,9 +243,10 @@ async function announceCrossRound(gid, room, title){
 
   const gName = await groupName(gid);
   for (const m of room.bracket.cross) for (const uid of [m.a,m.b]) if (uid){
+    const idx = room.bracket.cross.indexOf(m);
     await safePush(uid, [
-      { type:'text', text:`📝 ${title} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'cross', null, room.bracket.cross.indexOf(m)) },
-      choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'cross', null, room.bracket.cross.indexOf(m)),
+      { type:'text', text:`📝 ${title} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'cross', null, idx) },
+      choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'cross', null, idx),
       { type:'text', text:`เลือกเสร็จ รอประกาศผลในกลุ่ม “${gName}” เลย!` }
     ]);
   }
@@ -247,14 +277,44 @@ function flexMatchResult(title, aName, aH, bName, bH, winName){
   };
 }
 
+/* ========== SIMULATE QUEUE (Placement 1–16) ========== */
+function makeMatchesFromPairs(pairs){
+  return pairs.map(([a,b])=>({ a:a||null, b:b||null, state:'pending', moves:{}, winner:null, loser:null }));
+}
+function enqueueStage(room, key, title, idList){
+  room.simCtx.queue.push({ key, title, pairs: toPairs(idList) });
+}
+async function startNextSimStage(gid, room){
+  const stage = room.simCtx.queue.shift();
+  if (!stage){
+    // If all ranks assigned, announce
+    const ranks = room.simCtx.result; // uid->rank
+    if (Object.keys(ranks).length === 16) {
+      const ordered = Object.entries(ranks).sort((a,b)=>a[1]-b[1]);
+      const lines = ordered.map(([uid,rank])=>`${rank}) ${pretty(room, uid)}`);
+      await safePush(gid, { type:'text', text:`📊 ผลจัดอันดับครบ 1–16 (Simulation)\n\n${lines.join('\n')}` });
+    } else {
+      await safePush(gid, { type:'text', text:`🏁 จำลองสิ้นสุด` });
+    }
+    // finish
+    room.phase='finished'; room.stage='finished';
+    return;
+  }
+  room.simCtx.key = stage.key;
+  room.simCtx.title = stage.title;
+  room.bracket.sim = makeMatchesFromPairs(stage.pairs);
+  await announceSimRound(gid, room, stage.title);
+}
+
 /* ========== EVENT HANDLER ========== */
 async function handleEvent(e){
-  /* --- POSTBACK จาก DM (เลือกหมัดแบบชัวร์ต่อหลายกลุ่ม) --- */
+
+  /* --- POSTBACK จาก DM (เลือกหมัดพร้อมป้องกันเล่นหลายกลุ่ม) --- */
   if (e.type === 'postback' && typeof e.postback?.data === 'string') {
     const data = e.postback.data.split('|'); // jg|<gid>|<stage>|<pool>|<idx>|<hand>
     if (data[0] === 'jg') {
       const gid   = data[1];
-      const stage = data[2];                 // 'pools' | 'cross'
+      const stage = data[2];                 // 'pools' | 'cross' | 'sim'
       const pool  = data[3] === '-' ? null : data[3];
       const idx   = Number(data[4]);
       const hand  = data[5];
@@ -262,29 +322,35 @@ async function handleEvent(e){
 
       if (!rooms.has(gid)) return;
       const room = rooms.get(gid);
+      const gName = await groupName(gid);
 
       if (stage === 'pools') {
         const m = room.bracket.pools[pool]?.[idx];
         if (m?.state === 'pending' && (m.a === uid || m.b === uid)) {
           m.moves[uid] = hand;
-          const gName = await groupName(gid);
-          await safeReply(e.replyToken, { type:'text', text:`รับทราบ: ${hand.toUpperCase()} ${EMOJI[hand]} ✓  รอคู่แข่งแล้วไปลุ้นผลในกลุ่ม “${gName}”` });
+          await safeReply(e.replyToken, { type:'text', text: pickCompliment(hand, gName) });
           await tryCloseMatch_Pool(gid, room, pool, idx);
         }
       } else if (stage === 'cross') {
         const m = room.bracket.cross?.[idx];
         if (m?.state === 'pending' && (m.a === uid || m.b === uid)) {
           m.moves[uid] = hand;
-          const gName = await groupName(gid);
-          await safeReply(e.replyToken, { type:'text', text:`รับทราบ: ${hand.toUpperCase()} ${EMOJI[hand]} ✓  รอคู่แข่งแล้วไปลุ้นผลในกลุ่ม “${gName}”` });
+          await safeReply(e.replyToken, { type:'text', text: pickCompliment(hand, gName) });
           await tryCloseMatch_Cross(gid, room, idx);
+        }
+      } else if (stage === 'sim') {
+        const m = room.bracket.sim?.[idx];
+        if (m?.state === 'pending' && (m.a === uid || m.b === uid)) {
+          m.moves[uid] = hand;
+          await safeReply(e.replyToken, { type:'text', text: pickCompliment(hand, gName) });
+          await tryCloseMatch_Sim(gid, room, idx);
         }
       }
     }
     return;
   }
 
-  /* --- ข้อความใน DM (fallback: ให้กดปุ่ม) --- */
+  /* --- ข้อความใน DM (fallback: ให้กดปุ่ม postback) --- */
   if (e.type==='message' && e.message.type==='text' && e.source.type==='user') {
     const t = (e.message.text||'').trim().toLowerCase();
     if (!HANDS.includes(t)) {
@@ -293,8 +359,7 @@ async function handleEvent(e){
       ]);
       return;
     }
-    // ข้อความ DM แบบพิมพ์เองจะไม่รู้แมตช์ไหนถ้าเล่นหลายกลุ่ม — ให้ผู้ใช้กดปุ่ม postback แทน
-    await safeReply(e.replyToken, { type:'text', text:'เพื่อป้องกันสับสนเมื่อคุณเล่นหลายทัวร์พร้อมกัน โปรดแตะปุ่มเลือกหมัดที่ส่งไปให้ (มีชื่อกลุ่มระบุไว้แล้ว) ครับ 🙏' });
+    await safeReply(e.replyToken, { type:'text', text:'เพื่อป้องกันสับสนเมื่อคุณเล่นหลายทัวร์พร้อมกัน โปรดกดปุ่มเลือกหมัดที่มีชื่อกลุ่มกำกับครับ 🙏' });
     return;
   }
 
@@ -323,7 +388,8 @@ async function handleEvent(e){
       room.phase  = 'register';
       room.stage  = 'pools';
       room.players = new Map();
-      room.bracket = { round:0, pools:{A:[],B:[],C:[],D:[]}, waitingOdd:null, cross:[] };
+      room.bracket = { round:0, pools:{A:[],B:[],C:[],D:[]}, waitingOdd:null, cross:[], sim:[] };
+      room.simCtx = { key:'', title:'', queue:[], result:{}, tmp:{} };
 
       const announce = [
         `🎌✨  JANKEN TOURNAMENT เปิดฉากแล้ว!! ✨🎌 (กลุ่ม “${gName}”)`,
@@ -363,10 +429,7 @@ async function handleEvent(e){
       room.phase='playing';
       room.stage='pools';
 
-      await safePush(gid, { type:'text', text:`📣 Match ${room.bracket.round} เริ่มแล้ว (ผู้เล่น ${room.players.size})` });
-
       await announcePoolsRound(gid, room, `📣 Match ${room.bracket.round} เริ่มแล้ว (ผู้เล่น ${room.players.size})`);
-
       await safePush(gid, { type:'text', text:`📩 กรุณาเช็คไลน์ส่วนตัวเพื่อเลือกหมัดดวลกับคู่ต่อสู้ของคุณ (กลุ่ม “${gName}”)` });
       break;
     }
@@ -384,15 +447,15 @@ async function handleEvent(e){
       await safeReply(e.replyToken, { type:'text', text:'♻️ รีเซ็ตแล้ว — janken open เพื่อเริ่มใหม่' });
       break;
     }
-      
-        case 'simulate': {
-      // จำกัดสิทธิ์: ถ้ากำหนด admin แล้ว อนุญาตเฉพาะ admin
+
+    /* ===== SIMULATE: 16 ผู้เล่น รวมคุณ และคุณเลือกหมัดใน DM ได้ + Placement 1–16 ===== */
+    case 'simulate': {
       if (room.admin && room.admin !== e.source.userId) {
         await safeReply(e.replyToken, { type:'text', text:'❌ เฉพาะผู้สร้างเท่านั้นที่สามารถสั่ง simulate ได้' });
         break;
       }
 
-      // เตรียมชื่อผู้สั่ง (ให้คุณเป็นผู้เล่นจริง 1 ที่แน่ๆ)
+      // ผู้สั่งเป็นผู้เล่นจริงเสมอ
       const requesterId = e.source.userId;
       let requesterName = 'You';
       try {
@@ -402,107 +465,40 @@ async function handleEvent(e){
 
       room.admin = requesterId;
       room.phase = 'playing';
-      room.stage = 'pools';
+      room.stage = 'sim';
+      room.bracket.round = 1;
+      room.simCtx = { key:'', title:'', queue:[], result:{}, tmp:{} };
 
-      const gName = await groupName(gid);
-
-      // 1) รวบรวมผู้เล่นที่ join จริงในห้อง (ถ้ามี)
-      //    + ใส่ requester ให้แน่ใจว่าอยู่ในรายการ
-      const realEntries = new Map(room.players); // อาจว่างถ้ายังไม่เคย open/join
+      // รวมผู้ที่ join + requester และเติม mock ให้ครบ 16
+      const realEntries = new Map(room.players);
       realEntries.set(requesterId, { name: requesterName });
 
-      // 2) เอาผู้เล่นจริงมาสุ่ม แล้ว "คง requester ไว้" เสมอ
+      const MAX = 16;
       const realIds = [...realEntries.keys()];
       const others = realIds.filter(id => id !== requesterId);
       const shuffledOthers = shuffle(others);
 
-      // 3) สร้างผู้เล่นจำลองจน “ครบ 16”
-      const MAX = 16;
-      const selected = [requesterId, ...shuffledOthers].slice(0, MAX); // กันเกิน
-      while (selected.length < MAX) {
-        selected.push(`mock_${selected.length}`);
-      }
+      const selected = [requesterId, ...shuffledOthers].slice(0, MAX);
+      while (selected.length < MAX) selected.push(`mock_${selected.length}`);
 
-      // 4) สร้างชื่อสำหรับ mock ที่เหลือ
+      // ตั้งชื่อผู้เล่น
       const playersMap = new Map();
-      // ใส่ของจริงก่อน
       for (const uid of selected) {
-        if (realEntries.has(uid)) {
-          playersMap.set(uid, { name: realEntries.get(uid).name });
-        }
+        if (realEntries.has(uid)) playersMap.set(uid, { name: realEntries.get(uid).name });
       }
-      // เติม mock ที่ยังไม่มีชื่อ
       let mockNo = 1;
-      for (const uid of selected) {
-        if (!playersMap.has(uid)) {
-          playersMap.set(uid, { name: `Player${mockNo++}` });
-        }
-      }
-
-      // เขียนทับ state ผู้เล่นเป็นชุดที่คัดแล้ว
+      for (const uid of selected) if (!playersMap.has(uid)) playersMap.set(uid, { name:`Player${mockNo++}` });
       room.players = playersMap;
 
-      // แจ้งเริ่มจำลอง
-      await safePush(gid, {
-        type:'text',
-        text: `🧪 เริ่มจำลอง Janken Tournament (กลุ่ม “${gName}”)\nผู้เล่นทั้งหมด: ${room.players.size} คน\n- ผู้สั่งคำสั่งจะถูกนับเป็นผู้เล่นจริงเสมอ`
+      await safePush(gid, { type:'text',
+        text:`🧪 เริ่มจำลอง (Placement ครบ 1–16) — ผู้เล่น ${room.players.size} คน (กลุ่ม “${gName}”)\n- คุณจะเลือกหมัดใน DM ได้จริง\n- ผู้เล่น mock จะออกรอบอัตโนมัติ`
       });
 
-      // ===== จำลองน็อคเอาต์ไปเรื่อยๆ =====
-      const randomHand = () => HANDS[Math.floor(Math.random() * HANDS.length)];
-      let remaining = [...room.players.keys()];
-      let round = 1;
-      const rank = [];
-
-      while (remaining.length > 1) {
-        const pairs = toPairs(remaining);
-        const winners = [];
-
-        await safePush(gid, { type:'text', text:`📣 เริ่มรอบที่ ${round} — ผู้เล่น ${remaining.length}` });
-
-        for (const [a, b] of pairs) {
-          if (!a || !b) { // bye
-            winners.push(a || b);
-            await safePush(gid, { type:'text', text:`✅ ${pretty(room, a || b)} ได้สิทธิ์บาย` });
-            continue;
-          }
-
-          // สุ่มหมัด + ตัดสิน
-          let aH = randomHand(), bH = randomHand();
-          let res = judge(aH, bH);
-          if (res === 'DRAW') {
-            // reroll ให้มีผู้ชนะในรอบจำลอง
-            aH = randomHand(); bH = randomHand();
-            res = judge(aH, bH);
-            if (res === 'DRAW') res = Math.random() > 0.5 ? 'A' : 'B';
-          }
-
-          const winner = (res === 'A') ? a : b;
-          const loser  = (res === 'A') ? b : a;
-          winners.push(winner);
-          rank.unshift(loser);
-
-          const msg = `${pretty(room,a)} ${EMOJI[aH]}  vs  ${pretty(room,b)} ${EMOJI[bH]}  ➜  ${pretty(room,winner)} ชนะ`;
-          await safePush(gid, { type:'text', text: msg });
-        }
-
-        remaining = winners;
-        round++;
-      }
-
-      // เหลือแชมป์ 1 คน
-      rank.unshift(remaining[0]);
-
-      const podium = rank.map((uid, i) => `${i + 1}. ${pretty(room, uid)}`).join('\n');
-      await safePush(gid, {
-        type:'text',
-        text: `🏁 จำลองการแข่งขันสิ้นสุด\n\n🏆 อันดับสรุป (1–${rank.length})\n${podium}`
-      });
-
-      room.phase = 'finished';
+      // Enqueue สเตจทั้งหมดแบบ dynamic เริ่มจาก R16
+      enqueueStage(room, 'R16', '📣 รอบ 16 ทีม (Main Bracket)', selected);
+      await startNextSimStage(gid, room);
       break;
     }
-
 
     default: {
       await safeReply(e.replyToken, menuFlex());
@@ -510,7 +506,7 @@ async function handleEvent(e){
   }
 }
 
-/* ========== MATCH RESOLUTION ========== */
+/* ========== MATCH RESOLUTION (NORMAL) ========== */
 async function tryCloseMatch_Pool(gid, room, k, idx){
   const m = room.bracket.pools[k][idx];
   const aH = m.moves[m.a], bH = m.moves[m.b];
@@ -546,6 +542,7 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
   const lines=[]; for (const kk of POOLS) if (winners[kk].length) lines.push(`สาย ${kk}: ${winners[kk].map(u=>pretty(room,u)).join(', ')}`);
   await tryPushFlexOrText(gid, 'สรุปผลรอบนี้', lines);
 
+  // กรณีมีคนค้าง odd ในรอบแรก
   if (room.bracket.round===1 && room.bracket.waitingOdd){
     const flat = Object.values(winners).flat();
     if (flat.length){
@@ -558,6 +555,7 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
     }
   }
 
+  // ถ้าในสายยังเหลือมากกว่า 1 ให้จับคู่ต่อในสาย
   const eachPoolSingle = POOLS.every(kk => winners[kk].length<=1);
   if (!eachPoolSingle){
     const next={A:[],B:[],C:[],D:[]};
@@ -571,6 +569,7 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
     return;
   }
 
+  // ข้ามสาย (cross)
   const champs = Object.values(winners).flat();
   if (champs.length === 1){
     await safePush(gid, { type:'text', text:`🏆 แชมป์: ${pretty(room,champs[0])}` });
@@ -586,6 +585,7 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
   await announceCrossRound(gid, room, '🏁 รอบรวม (ข้ามสาย)');
 }
 
+/* ========== MATCH RESOLUTION (CROSS) ========== */
 async function tryCloseMatch_Cross(gid, room, idx){
   const m = room.bracket.cross[idx];
   const aH = m.moves[m.a], bH = m.moves[m.b];
@@ -625,4 +625,176 @@ async function tryCloseMatch_Cross(gid, room, idx){
   room.bracket.cross = next;
   room.bracket.round += 1;
   await announceCrossRound(gid, room, `🏁 รอบรวม (รอบที่ ${room.bracket.round})`);
+}
+
+/* ========== SIMULATE (เลือกจริงใน DM + mock ออโต้) ========== */
+async function announceSimRound(gid, room, title){
+  const lines = room.bracket.sim.map((m,i)=>`Match ${i+1}: ${pretty(room,m.a)} vs ${pretty(room,m.b)}`);
+  await tryPushFlexOrText(gid, title, lines);
+
+  const gName = await groupName(gid);
+
+  for (let i=0; i<room.bracket.sim.length; i++){
+    const m = room.bracket.sim[i];
+
+    for (const uid of [m.a, m.b]) {
+      if (!uid) continue;
+
+      if (isMock(uid)) {
+        m.moves[uid] = randomHand();
+      } else {
+        await safePush(uid, [
+          { type:'text', text:`📝 รอบจำลองในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'sim', null, i) },
+          choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'sim', null, i),
+          { type:'text', text:`เลือกเสร็จ รอประกาศผลในกลุ่ม “${gName}” เลย!` }
+        ]);
+      }
+    }
+
+    if ((m.a && isMock(m.a)) && (m.b && isMock(m.b))) {
+      await tryCloseMatch_Sim(gid, room, i);
+    }
+  }
+}
+
+async function tryCloseMatch_Sim(gid, room, idx){
+  const m = room.bracket.sim[idx];
+  if (!m || m.state !== 'pending') return;
+
+  const aH = m.moves[m.a], bH = m.moves[m.b];
+
+  if (m.a && !m.b) {
+    m.winner=m.a; m.loser=null; m.state='done';
+    await safePush(gid, { type:'text', text:`✅ Match ${idx+1}: ${pretty(room,m.a)} ได้สิทธิ์บาย` });
+  } else if (m.b && !m.a) {
+    m.winner=m.b; m.loser=null; m.state='done';
+    await safePush(gid, { type:'text', text:`✅ Match ${idx+1}: ${pretty(room,m.b)} ได้สิทธิ์บาย` });
+  } else if (aH && bH){
+    let r = judge(aH,bH);
+    if (r === 'DRAW') {
+      const aMock = isMock(m.a), bMock = isMock(m.b);
+      if (aMock) m.moves[m.a] = randomHand();
+      if (bMock) m.moves[m.b] = randomHand();
+      const a2 = m.moves[m.a], b2 = m.moves[m.b];
+      r = judge(a2, b2);
+      if (r === 'DRAW') r = Math.random() > 0.5 ? 'A' : 'B';
+    }
+
+    m.winner = r==='A'? m.a : m.b; 
+    m.loser  = r==='A'? m.b : m.a; 
+    m.state='done';
+
+    try{
+      await client.pushMessage(gid, [ flexMatchResult(`${room.simCtx.title}`, pretty(room,m.a), m.moves[m.a], pretty(room,m.b), m.moves[m.b], pretty(room,m.winner)) ]);
+    }catch{
+      await safePush(gid, { type:'text', text:`${room.simCtx.title}\n${pretty(room,m.a)} ${EMOJI[m.moves[m.a]]||''} vs ${pretty(room,m.b)} ${EMOJI[m.moves[m.b]]||''}\nผู้ชนะ: ${pretty(room,m.winner)}` });
+    }
+  } else {
+    return; // ยังรอผู้เล่นจริงเลือกหมัด
+  }
+
+  // ถ้าทุกแมตช์ในรอบปิดครบ -> วางสเตจถัดไป/บันทึกอันดับ
+  const allDone = room.bracket.sim.every(x=>x.state==='done');
+  if (!allDone) return;
+
+  const winners = room.bracket.sim.map(x=>x.winner).filter(Boolean);
+  const losers  = room.bracket.sim.map(x=>x.loser ).filter(Boolean);
+
+  // วางต่อจากคีย์สเตจปัจจุบัน
+  const key = room.simCtx.key;
+  const res = room.simCtx.result;
+  switch (key) {
+    case 'R16': {
+      // winners -> QF, losers -> 9–16 R1
+      enqueueStage(room, 'QF', '📣 รอบ 8 ทีม (Quarterfinals)', winners);
+      enqueueStage(room, 'PL_9_16_R1', '🎖 จัดอันดับ 9–16 (รอบแรก)', losers);
+      break;
+    }
+    case 'QF': {
+      // winners -> SF, losers -> 5–8 R1
+      enqueueStage(room, 'SF', '📣 รอบรองชนะเลิศ (Semifinals)', winners);
+      enqueueStage(room, 'PL_5_8_R1', '🏅 จัดอันดับ 5–8 (รอบแรก)', losers);
+      break;
+    }
+    case 'SF': {
+      // winners -> FINAL, losers -> BRONZE
+      enqueueStage(room, 'FINAL',  '🏆 ชิงชนะเลิศ (Final)', winners);
+      enqueueStage(room, 'BRONZE', '🥉 ชิงอันดับ 3–4 (Bronze)', losers);
+      break;
+    }
+    case 'FINAL': {
+      // winner=1, loser=2
+      if (winners[0]) res[winners[0]] = 1;
+      if (losers[0])  res[losers[0]]  = 2;
+      break;
+    }
+    case 'BRONZE': {
+      // winner=3, loser=4
+      if (winners[0]) res[winners[0]] = 3;
+      if (losers[0])  res[losers[0]]  = 4;
+      break;
+    }
+    case 'PL_5_8_R1': {
+      // winners -> 5/6 Final, losers -> 7/8 Final
+      enqueueStage(room, 'PL_5_6_FINAL', '🏅 ชิงอันดับ 5–6', winners);
+      enqueueStage(room, 'PL_7_8_FINAL', '🏅 ชิงอันดับ 7–8', losers);
+      break;
+    }
+    case 'PL_5_6_FINAL': {
+      if (winners[0]) res[winners[0]] = 5;
+      if (losers[0])  res[losers[0]]  = 6;
+      break;
+    }
+    case 'PL_7_8_FINAL': {
+      if (winners[0]) res[winners[0]] = 7;
+      if (losers[0])  res[losers[0]]  = 8;
+      break;
+    }
+    case 'PL_9_16_R1': {
+      // winners -> 9–12 SF, losers -> 13–16 SF
+      enqueueStage(room, 'PL_9_12_SF',  '🎖 จัดอันดับ 9–12 (รองรองชนะเลิศ)', winners);
+      enqueueStage(room, 'PL_13_16_SF', '🎖 จัดอันดับ 13–16 (รองรองชนะเลิศ)', losers);
+      break;
+    }
+    case 'PL_9_12_SF': {
+      // winners -> 9/10 Final, losers -> 11/12 Final
+      enqueueStage(room, 'PL_9_10_FINAL',  '🎖 ชิงอันดับ 9–10', winners);
+      enqueueStage(room, 'PL_11_12_FINAL', '🎖 ชิงอันดับ 11–12', losers);
+      break;
+    }
+    case 'PL_13_16_SF': {
+      // winners -> 13/14 Final, losers -> 15/16 Final
+      enqueueStage(room, 'PL_13_14_FINAL', '🎖 ชิงอันดับ 13–14', winners);
+      enqueueStage(room, 'PL_15_16_FINAL', '🎖 ชิงอันดับ 15–16', losers);
+      break;
+    }
+    case 'PL_9_10_FINAL': {
+      if (winners[0]) res[winners[0]] = 9;
+      if (losers[0])  res[losers[0]]  = 10;
+      break;
+    }
+    case 'PL_11_12_FINAL': {
+      if (winners[0]) res[winners[0]] = 11;
+      if (losers[0])  res[losers[0]]  = 12;
+      break;
+    }
+    case 'PL_13_14_FINAL': {
+      if (winners[0]) res[winners[0]] = 13;
+      if (losers[0])  res[losers[0]]  = 14;
+      break;
+    }
+    case 'PL_15_16_FINAL': {
+      if (winners[0]) res[winners[0]] = 15;
+      if (losers[0])  res[losers[0]]  = 16;
+      break;
+    }
+  }
+
+  // ถ้ายังไม่ครบ 16 อันดับ → ไปสเตจถัดไป
+  if (Object.keys(room.simCtx.result).length < 16) {
+    await startNextSimStage(gid, room);
+  } else {
+    // ครบแล้วก็สรุปใน startNextSimStage เมื่อ queue หมด
+    await startNextSimStage(gid, room);
+  }
 }
