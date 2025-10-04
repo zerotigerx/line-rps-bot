@@ -312,4 +312,4 @@ app.get('/', (_req, res) => res.send('RPS Tournament Bot is running.'))
 
 // ----- Start server -----
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`))
