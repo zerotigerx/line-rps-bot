@@ -54,8 +54,26 @@ async function groupName(gid){
   }catch{}
   return '(กลุ่มของคุณ)';
 }
-async function safePush(to, msgs){ try{ await client.pushMessage(to, Array.isArray(msgs)?msgs:[msgs]); }catch(e){ console.warn('push fail', e?.response?.data || e?.message); } }
-async function safeReply(token, msgs){ try{ await client.replyMessage(token, Array.isArray(msgs)?msgs:[msgs]); }catch(e){ console.warn('reply fail', e?.response?.data || e?.message); } }
+// ---------- replace safePush / safeReply with verbose versions ----------
+async function safePush(to, msgs){
+  try {
+    const payload = Array.isArray(msgs) ? msgs : [msgs];
+    await client.pushMessage(to, payload);
+  } catch (e) {
+    const detail = e?.response?.data || e?.message || e;
+    console.warn('[PUSH FAIL]', JSON.stringify(detail, null, 2), 'to:', to);
+  }
+}
+
+async function safeReply(token, msgs){
+  try {
+    const payload = Array.isArray(msgs) ? msgs : [msgs];
+    await client.replyMessage(token, payload);
+  } catch (e) {
+    const detail = e?.response?.data || e?.message || e;
+    console.warn('[REPLY FAIL]', JSON.stringify(detail, null, 2));
+  }
+}
 
 /* -------- Room factory -------- */
 function ensureRoom(gid){
@@ -438,6 +456,46 @@ async function handleEvent(e){
   try { const prof = await client.getGroupMemberProfile(gid, e.source.userId); if (prof?.displayName) displayName = prof.displayName; } catch {}
 
   switch(action){
+
+        // ===== Debug: บอก id ตัวเอง + กลุ่ม เพื่อเช็คว่าบอทที่คุยอยู่ตัวเดียวกับที่ตั้งค่า token ไหม
+    case 'whoami': {
+      const uid = e.source.userId;
+      const groupId = e.source.groupId;
+      await safeReply(e.replyToken, {
+        type: 'text',
+        text: [
+          '🧪 Debug /whoami',
+          `• userId: ${uid}`,
+          `• groupId: ${groupId}`,
+          `• กรุณาเปิดแชท 1:1 กับบอทนี้ แล้วพิมพ์ "hello" ให้มีประวัติคุยกัน`,
+          `จากนั้นกลับมากลุ่มและลอง "janken testdm"`,
+        ].join('\n')
+      });
+      break;
+    }
+
+    // ===== Debug: ทดสอบ DM หาตัวคนสั่งเอง
+    case 'testdm': {
+      const uid = e.source.userId;
+      const gName = await groupName(e.source.groupId);
+      await safeReply(e.replyToken, { type:'text', text:'🧪 กำลังลองส่ง DM ให้คุณ…' });
+
+      try{
+        await client.pushMessage(uid, [
+          { type:'text', text:`DM ทดสอบจากบอท ✅ (กลุ่ม “${gName}”)` },
+          { type:'text', text:'ถ้าข้อความนี้ถึง แปลว่าบอทส่ง DM ถึงคุณได้ปกติ 🎯' }
+        ]);
+        await safePush(e.source.groupId, { type:'text', text:'✅ DM ทดสอบ: ส่งถึงคุณสำเร็จ' });
+      }catch(e){
+        const detail = e?.response?.data || e?.message || e;
+        await safePush(e.source.groupId, {
+          type:'text',
+          text:'❌ DM ทดสอบล้มเหลว\n' + JSON.stringify(detail, null, 2)
+        });
+        console.warn('[TESTDM FAIL]', JSON.stringify(detail, null, 2), 'to:', uid);
+      }
+      break;
+    }
 
     case 'open': {
       room.admin  = room.admin || e.source.userId;
