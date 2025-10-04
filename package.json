@@ -1,0 +1,11 @@
+{
+  "name": "line-rps-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4",
+    "@line/bot-sdk": "^7",
+    "dotenv": "^16"
+  }
+}
