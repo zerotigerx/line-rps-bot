@@ -384,6 +384,79 @@ async function handleEvent(e){
       await safeReply(e.replyToken, { type:'text', text:'♻️ รีเซ็ตแล้ว — janken open เพื่อเริ่มใหม่' });
       break;
     }
+      
+    case 'simulate': {
+      // ตรวจสอบสิทธิ์ (เฉพาะแอดมิน หรือเปิดให้แอดมินคนแรกเท่านั้น)
+      if (room.admin && room.admin !== e.source.userId) {
+        await safeReply(e.replyToken, { type:'text', text:'❌ เฉพาะผู้สร้างเท่านั้นที่สามารถสั่ง simulate ได้' });
+        break;
+      }
+
+      room.admin = e.source.userId;
+      room.phase = 'playing';
+      room.stage = 'pools';
+
+      const gName = await groupName(gid);
+
+      // สร้าง mock player 16 คน
+      const mockPlayers = [];
+      for (let i=1; i<=16; i++) mockPlayers.push(`Player${i}`);
+      room.players = new Map(mockPlayers.map((n,i)=>[`mock${i}`, {name:n}]));
+
+      await safePush(gid, {
+        type:'text',
+        text:`🧪 เริ่มจำลอง Janken Tournament (กลุ่ม “${gName}”)\nผู้เล่นทั้งหมด: ${mockPlayers.length} คน`
+      });
+
+      // จำลองการแข่งแต่ละรอบ (สุ่มผล)
+      const randomHand = () => HANDS[Math.floor(Math.random()*HANDS.length)];
+      let remaining = [...room.players.keys()];
+      let round = 1;
+      const rank = [];
+
+      while (remaining.length > 1) {
+        const pairs = toPairs(remaining);
+        const winners = [];
+
+        await safePush(gid, { type:'text', text:`📣 เริ่มรอบที่ ${round} — ผู้เล่น ${remaining.length}` });
+
+        for (const [a,b] of pairs) {
+          if (!a || !b) { // bye
+            winners.push(a || b);
+            continue;
+          }
+          const aH = randomHand(), bH = randomHand();
+          const res = judge(aH,bH);
+          let winner, loser;
+          if (res === 'A') { winner=a; loser=b; }
+          else if (res === 'B') { winner=b; loser=a; }
+          else { // DRAW -> เลือกใหม่
+            const reroll = Math.random()>0.5 ? 'A' : 'B';
+            winner = reroll==='A'?a:b;
+            loser = reroll==='A'?b:a;
+          }
+          winners.push(winner);
+          rank.unshift(loser);
+
+          const msg = `${pretty(room,a)} ${EMOJI[aH]} vs ${pretty(room,b)} ${EMOJI[bH]} ➜ ${pretty(room,winner)} ชนะ`;
+          await safePush(gid, { type:'text', text:msg });
+        }
+
+        remaining = winners;
+        round++;
+      }
+
+      rank.unshift(remaining[0]); // แชมป์
+      const resultLines = rank.map((uid,i)=>`${i+1}. ${pretty(room,uid)}`).join('\n');
+
+      await safePush(gid, {
+        type:'text',
+        text:`🏁 จำลองการแข่งขันสิ้นสุด\n\n🏆 อันดับสุดท้าย\n${resultLines}`
+      });
+
+      room.phase = 'finished';
+      break;
+    }
 
     default: {
       await safeReply(e.replyToken, menuFlex());
