@@ -312,13 +312,30 @@ async function handleEvent(e){
       await safeReply(e.replyToken, [ flexMenu(), {type:'text', text:`🟢 เปิดรับสมัครแล้ว — แอดมิน: ${displayName}`} ]);
       break;
     }
-    case 'join': {
-      if (room.phase!=='register') { await safeReply(e.replyToken, {type:'text', text:'ยังไม่เปิดรับสมัคร'}); break; }
-      const name = (rest.join(' ') || displayName).slice(0,40);
-      room.players.set(e.source.userId, {name});
-      await safeReply(e.replyToken, [{type:'text', text:`✅ เข้าร่วมแล้ว: ${name} (รวม ${room.players.size})`}]);
-      break;
-    }
+      case 'join': {
+        if (room.phase !== 'register') {
+          await safeReply(e.replyToken, { type: 'text', text: 'ยังไม่เปิดรับสมัคร' });
+          break;
+        }
+      
+        // จำกัดจำนวนผู้เล่นสูงสุด 20 คน
+        const MAX_PLAYERS = 20;
+        if (room.players.size >= MAX_PLAYERS) {
+          await safeReply(e.replyToken, {
+            type: 'text',
+            text: `❌ ขอโทษครับ ทัวร์นาเมนต์นี้เต็มแล้ว (${MAX_PLAYERS} คน)`
+          });
+          break;
+        }
+      
+        const name = (rest.join(' ') || displayName).slice(0, 40);
+        room.players.set(e.source.userId, { name });
+        await safeReply(e.replyToken, [{
+          type: 'text',
+          text: `✅ เข้าร่วมแล้ว: ${name} (รวม ${room.players.size}/${MAX_PLAYERS})`
+        }]);
+        break;
+      }
     case 'close': {
       if (room.phase!=='register') { await safeReply(e.replyToken, {type:'text', text:'ยังไม่ได้เปิดรับสมัคร'}); break; }
       if (room.players.size<2) { await safeReply(e.replyToken, {type:'text', text:'ต้องมีอย่างน้อย 2 คน'}); break; }
