@@ -406,10 +406,17 @@ function advanceIfReady(room) {
 }
 
 // ---------------------- Webhook ----------------------
-app.post("/webhook", middleware(config), async (req, res) => {
-  const events = req.body.events;
-  await Promise.all(events.map(handleEvent));
-  res.sendStatus(200);
+app.post('/webhook', middleware(config), async (req, res) => {
+  try {
+    const events = Array.isArray(req.body?.events) ? req.body.events : [];
+    if (events.length) {
+      await Promise.all(events.map(handleEvent));
+    }
+    return res.sendStatus(200);    // สำคัญ: ตอบ 200 แม้ไม่มี event (ตอน Verify)
+  } catch (e) {
+    console.error('Webhook error:', e);
+    return res.sendStatus(200);    // อย่าให้ Verify ล้ม
+  }
 });
 
 async function handleEvent(event) {
