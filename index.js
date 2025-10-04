@@ -1,4 +1,4 @@
-// Janken Tournament — Full (Pools A–D, DM prompts, Flex with fallback, 20 players cap)
+// Janken Tournament — Full (Pools A–D, DM buttons, Flex with fallback, 20 players cap)
 import 'dotenv/config';
 import express from 'express';
 import { middleware, Client } from '@line/bot-sdk';
@@ -101,7 +101,7 @@ function openBannerFlex(){
   };
 }
 
-// bubble สรุปคู่ (เราจะแตกหน้าอัตโนมัติ)
+// สรุปคู่ (แตกหน้าอัตโนมัติ + fallback)
 function buildFlexRoundPairs(title, lines){
   return {
     type:'flex', altText:title, contents:{
@@ -130,23 +130,21 @@ async function tryPushFlexOrText(to, title, lines){
   }
 }
 
-// bubble ผลการแข่งขัน
-function flexMatchResult(title, aName, aHand, bName, bHand, winnerName){
+// Flex ปุ่มเลือกหมัดใน DM (ไม่ต้องพิมพ์เอง)
+function choiceFlex(title='เลือกหมัดของคุณ'){
   return {
-    type:'flex', altText:title, contents:{
+    type:'flex',
+    altText:title,
+    contents:{
       type:'bubble',
       header:{ type:'box', layout:'vertical', contents:[ { type:'text', text:title, weight:'bold', size:'lg' } ] },
       body:{ type:'box', layout:'vertical', spacing:'md', contents:[
-        { type:'box', layout:'horizontal', contents:[
-          { type:'text', text:aName, weight:'bold', wrap:true },
-          { type:'text', text:bName, weight:'bold', align:'end', wrap:true }
-        ]},
-        { type:'box', layout:'horizontal', contents:[
-          { type:'text', text:`${aHand?EMOJI[aHand]:''} ${aHand?.toUpperCase()||''}`, color:'#666' },
-          { type:'text', text:`${bHand?EMOJI[bHand]:''} ${bHand?.toUpperCase()||''}`, color:'#666', align:'end' }
-        ]},
-        { type:'separator' },
-        { type:'text', text:`ผู้ชนะ: ${winnerName}`, weight:'bold' }
+        { type:'button', style:'primary', action:{ type:'message', label:'✊ ROCK',     text:'rock' } },
+        { type:'button', style:'primary', action:{ type:'message', label:'✋ PAPER',    text:'paper' } },
+        { type:'button', style:'primary', action:{ type:'message', label:'✌️ SCISSORS', text:'scissors' } },
+      ]},
+      footer:{ type:'box', layout:'vertical', contents:[
+        { type:'text', text:'(แตะปุ่มเพื่อเลือกหมัดได้เลย)', size:'xs', color:'#999' }
       ]}
     }
   };
@@ -172,10 +170,13 @@ async function announcePoolsRound(gid, room, title){
   }
   await tryPushFlexOrText(gid, title, lines);
 
-  // DM ขอหมัดทุกคนที่มีแมตช์
+  // DM ขอหมัดทุกคนที่มีแมตช์ (ทั้ง Quick Reply และ Flex ปุ่มใหญ่)
   for (const k of POOLS) for (const m of room.bracket.pools[k]) for (const uid of [m.a,m.b]) if (uid) {
     userToGroup.set(uid, gid);
-    await safePush(uid, [{ type:'text', text:`📝 รอบสาย ${k} — เลือกหมัด (rock/paper/scissors)`, quickReply: qr() }]);
+    await safePush(uid, [
+      { type:'text', text:`📝 รอบสาย ${k} — เลือกหมัด (rock/paper/scissors)`, quickReply: qr() },
+      choiceFlex('เลือกหมัดสำหรับรอบนี้')
+    ]);
   }
 }
 
@@ -184,7 +185,10 @@ async function announceCrossRound(gid, room, title){
   await tryPushFlexOrText(gid, title, lines);
   for (const m of room.bracket.cross) for (const uid of [m.a,m.b]) if (uid){
     userToGroup.set(uid, gid);
-    await safePush(uid, [{ type:'text', text:`📝 ${title} — เลือกหมัด (rock/paper/scissors)`, quickReply: qr() }]);
+    await safePush(uid, [
+      { type:'text', text:`📝 ${title} — เลือกหมัด`, quickReply: qr() },
+      choiceFlex('เลือกหมัดสำหรับรอบนี้')
+    ]);
   }
 }
 
@@ -193,7 +197,13 @@ async function handleEvent(e){
   // ---------- DM: ผู้เล่นเลือกหมัด ----------
   if (e.type==='message' && e.message.type==='text' && e.source.type==='user') {
     const choice = (e.message.text||'').trim().toLowerCase();
-    if (!HANDS.includes(choice)) { await safeReply(e.replyToken, {type:'text', text:'พิมพ์: rock | paper | scissors', quickReply: qr()}); return; }
+    if (!HANDS.includes(choice)) {
+      await safeReply(e.replyToken, [
+        {type:'text', text:'แตะปุ่มเพื่อเลือกหรือพิมพ์: rock / paper / scissors', quickReply: qr()},
+        choiceFlex('เลือกหมัดของคุณ')
+      ]);
+      return;
+    }
 
     const gid = userToGroup.get(e.source.userId);
     if (!gid || !rooms.has(gid)) { await safeReply(e.replyToken, {type:'text', text:'ยังไม่มีแมตช์รออยู่'}); return; }
@@ -208,7 +218,7 @@ async function handleEvent(e){
       (hand)=>`เลือกได้ดีนี่! ${hand}  สูดหายใจลึกๆ แล้วไปลุ้นพร้อมกันในกลุ่มเลย!`
     ];
     const handLabel = `${choice.toUpperCase()} ${EMOJI[choice]}`;
-    await safeReply(e.replyToken, { type:'text', text: pick[Math.floor(Math.random()*pick.length)](handLabel), quickReply: qr() });
+    await safeReply(e.replyToken, { type:'text', text: pick[Math.floor(Math.random()*pick.length)](handLabel) });
 
     // หา match ที่ user อยู่และยัง pending
     let found=null, poolKey=null, idx=-1;
@@ -350,7 +360,14 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
   else if (m.b && !m.a) { m.winner=m.b; m.loser=null; m.state='done'; await safePush(gid, { type:'text', text:`✅ สาย ${k} — Match ${idx+1}: ${pretty(room,m.b)} ได้สิทธิ์บาย` }); }
   else if (aH && bH){
     const r = judge(aH,bH);
-    if (r==='DRAW'){ m.moves={}; for (const uid of [m.a,m.b]) if (uid) await safePush(uid, [{type:'text', text:'เสมอ — เลือกใหม่', quickReply: qr()}]); return; }
+    if (r==='DRAW'){
+      m.moves={};
+      for (const uid of [m.a,m.b]) if (uid) await safePush(uid, [
+        {type:'text', text:'เสมอ — เลือกใหม่', quickReply: qr()},
+        choiceFlex('เลือกใหม่อีกครั้ง')
+      ]);
+      return;
+    }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
     // ส่งผลเป็น Flex (fallback อัตโนมัติ)
     try{
@@ -422,7 +439,14 @@ async function tryCloseMatch_Cross(gid, room, idx){
   else if (m.b && !m.a){ m.winner=m.b; m.loser=null; m.state='done'; }
   else if (aH && bH){
     const r = judge(aH,bH);
-    if (r==='DRAW'){ m.moves={}; for (const uid of [m.a,m.b]) if (uid) await safePush(uid,[{type:'text',text:'เสมอ — เลือกใหม่', quickReply: qr()}]); return; }
+    if (r==='DRAW'){
+      m.moves={};
+      for (const uid of [m.a,m.b]) if (uid) await safePush(uid, [
+        {type:'text', text:'เสมอ — เลือกใหม่', quickReply: qr()},
+        choiceFlex('เลือกใหม่อีกครั้ง')
+      ]);
+      return;
+    }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
   } else return;
 
