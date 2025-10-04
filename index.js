@@ -385,31 +385,71 @@ async function handleEvent(e){
       break;
     }
       
-    case 'simulate': {
-      // ตรวจสอบสิทธิ์ (เฉพาะแอดมิน หรือเปิดให้แอดมินคนแรกเท่านั้น)
+        case 'simulate': {
+      // จำกัดสิทธิ์: ถ้ากำหนด admin แล้ว อนุญาตเฉพาะ admin
       if (room.admin && room.admin !== e.source.userId) {
         await safeReply(e.replyToken, { type:'text', text:'❌ เฉพาะผู้สร้างเท่านั้นที่สามารถสั่ง simulate ได้' });
         break;
       }
 
-      room.admin = e.source.userId;
+      // เตรียมชื่อผู้สั่ง (ให้คุณเป็นผู้เล่นจริง 1 ที่แน่ๆ)
+      const requesterId = e.source.userId;
+      let requesterName = 'You';
+      try {
+        const p = await client.getGroupMemberProfile(gid, requesterId);
+        requesterName = p?.displayName || 'You';
+      } catch {}
+
+      room.admin = requesterId;
       room.phase = 'playing';
       room.stage = 'pools';
 
       const gName = await groupName(gid);
 
-      // สร้าง mock player 16 คน
-      const mockPlayers = [];
-      for (let i=1; i<=16; i++) mockPlayers.push(`Player${i}`);
-      room.players = new Map(mockPlayers.map((n,i)=>[`mock${i}`, {name:n}]));
+      // 1) รวบรวมผู้เล่นที่ join จริงในห้อง (ถ้ามี)
+      //    + ใส่ requester ให้แน่ใจว่าอยู่ในรายการ
+      const realEntries = new Map(room.players); // อาจว่างถ้ายังไม่เคย open/join
+      realEntries.set(requesterId, { name: requesterName });
 
+      // 2) เอาผู้เล่นจริงมาสุ่ม แล้ว "คง requester ไว้" เสมอ
+      const realIds = [...realEntries.keys()];
+      const others = realIds.filter(id => id !== requesterId);
+      const shuffledOthers = shuffle(others);
+
+      // 3) สร้างผู้เล่นจำลองจน “ครบ 16”
+      const MAX = 16;
+      const selected = [requesterId, ...shuffledOthers].slice(0, MAX); // กันเกิน
+      while (selected.length < MAX) {
+        selected.push(`mock_${selected.length}`);
+      }
+
+      // 4) สร้างชื่อสำหรับ mock ที่เหลือ
+      const playersMap = new Map();
+      // ใส่ของจริงก่อน
+      for (const uid of selected) {
+        if (realEntries.has(uid)) {
+          playersMap.set(uid, { name: realEntries.get(uid).name });
+        }
+      }
+      // เติม mock ที่ยังไม่มีชื่อ
+      let mockNo = 1;
+      for (const uid of selected) {
+        if (!playersMap.has(uid)) {
+          playersMap.set(uid, { name: `Player${mockNo++}` });
+        }
+      }
+
+      // เขียนทับ state ผู้เล่นเป็นชุดที่คัดแล้ว
+      room.players = playersMap;
+
+      // แจ้งเริ่มจำลอง
       await safePush(gid, {
         type:'text',
-        text:`🧪 เริ่มจำลอง Janken Tournament (กลุ่ม “${gName}”)\nผู้เล่นทั้งหมด: ${mockPlayers.length} คน`
+        text: `🧪 เริ่มจำลอง Janken Tournament (กลุ่ม “${gName}”)\nผู้เล่นทั้งหมด: ${room.players.size} คน\n- ผู้สั่งคำสั่งจะถูกนับเป็นผู้เล่นจริงเสมอ`
       });
 
-      // จำลองการแข่งแต่ละรอบ (สุ่มผล)
-      const randomHand = () => HANDS[Math.floor(Math.random()*HANDS.length)];
+      // ===== จำลองน็อคเอาต์ไปเรื่อยๆ =====
+      const randomHand = () => HANDS[Math.floor(Math.random() * HANDS.length)];
       let remaining = [...room.players.keys()];
       let round = 1;
       const rank = [];
@@ -420,43 +460,49 @@ async function handleEvent(e){
 
         await safePush(gid, { type:'text', text:`📣 เริ่มรอบที่ ${round} — ผู้เล่น ${remaining.length}` });
 
-        for (const [a,b] of pairs) {
+        for (const [a, b] of pairs) {
           if (!a || !b) { // bye
             winners.push(a || b);
+            await safePush(gid, { type:'text', text:`✅ ${pretty(room, a || b)} ได้สิทธิ์บาย` });
             continue;
           }
-          const aH = randomHand(), bH = randomHand();
-          const res = judge(aH,bH);
-          let winner, loser;
-          if (res === 'A') { winner=a; loser=b; }
-          else if (res === 'B') { winner=b; loser=a; }
-          else { // DRAW -> เลือกใหม่
-            const reroll = Math.random()>0.5 ? 'A' : 'B';
-            winner = reroll==='A'?a:b;
-            loser = reroll==='A'?b:a;
+
+          // สุ่มหมัด + ตัดสิน
+          let aH = randomHand(), bH = randomHand();
+          let res = judge(aH, bH);
+          if (res === 'DRAW') {
+            // reroll ให้มีผู้ชนะในรอบจำลอง
+            aH = randomHand(); bH = randomHand();
+            res = judge(aH, bH);
+            if (res === 'DRAW') res = Math.random() > 0.5 ? 'A' : 'B';
           }
+
+          const winner = (res === 'A') ? a : b;
+          const loser  = (res === 'A') ? b : a;
           winners.push(winner);
           rank.unshift(loser);
 
-          const msg = `${pretty(room,a)} ${EMOJI[aH]} vs ${pretty(room,b)} ${EMOJI[bH]} ➜ ${pretty(room,winner)} ชนะ`;
-          await safePush(gid, { type:'text', text:msg });
+          const msg = `${pretty(room,a)} ${EMOJI[aH]}  vs  ${pretty(room,b)} ${EMOJI[bH]}  ➜  ${pretty(room,winner)} ชนะ`;
+          await safePush(gid, { type:'text', text: msg });
         }
 
         remaining = winners;
         round++;
       }
 
-      rank.unshift(remaining[0]); // แชมป์
-      const resultLines = rank.map((uid,i)=>`${i+1}. ${pretty(room,uid)}`).join('\n');
+      // เหลือแชมป์ 1 คน
+      rank.unshift(remaining[0]);
 
+      const podium = rank.map((uid, i) => `${i + 1}. ${pretty(room, uid)}`).join('\n');
       await safePush(gid, {
         type:'text',
-        text:`🏁 จำลองการแข่งขันสิ้นสุด\n\n🏆 อันดับสุดท้าย\n${resultLines}`
+        text: `🏁 จำลองการแข่งขันสิ้นสุด\n\n🏆 อันดับสรุป (1–${rank.length})\n${podium}`
       });
 
       room.phase = 'finished';
       break;
     }
+
 
     default: {
       await safeReply(e.replyToken, menuFlex());
