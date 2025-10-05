@@ -1,7 +1,7 @@
-// index.js — Janken Tournament (Full Feature)
+// index.js — Janken Tournament (Full Service)
 // Multi-room safe / Admin-only close+reset / Odd -> BOT / Human always wins vs BOT (silent)
 // BOT always ranked last / Flex menus & results / DM with postback buttons & compliments
-// + Simulate 16 (include the real user) / Position Matches to place 3rd..N
+// + Simulate 16 (include the real user) / Position Matches to place 3rd..N (full pipeline)
 
 import 'dotenv/config';
 import express from 'express';
@@ -80,10 +80,13 @@ function ensureRoom(gid){
         round: 0,
         pools: { A:[], B:[], C:[], D:[] },
         cross: [],
-        waitingOdd: null
+        waitingOdd: null,
+        pos: [],
+        posRound: 0,
       },
       losers: [],                // ผู้แพ้ทั้งหมด (สำหรับ Position Matches)
-      rankOut: []                // เก็บลำดับผู้ตกรอบ (เวลาจริง)
+      rankOut: [],               // เก็บลำดับผู้ตกรอบ (เวลาจริง)
+      finalChampion: null,
     });
   }
   return rooms.get(gid);
@@ -269,6 +272,14 @@ async function handleEvent(e){
         await safeReply(e.replyToken, { type:'text', text:`${PRAISES[Math.floor(Math.random()*PRAISES.length)](hand)}\nเลือกแล้ว รอผลในกลุ่ม “${gName}”` });
         await tryCloseMatch_Cross(gid, room, idx);
       }
+    } else if (stage==='pos'){
+      const m = room.bracket.pos?.[idx];
+      if (m?.state==='pending' && (m.a===uid || m.b===uid)){
+        m.moves[uid] = hand;
+        const gName = await groupName(gid);
+        await safeReply(e.replyToken, { type:'text', text:`${PRAISES[Math.floor(Math.random()*PRAISES.length)](hand)}\nเลือกแล้ว รอผลในกลุ่ม “${gName}”` });
+        await tryCloseMatch_Position(gid, room, idx);
+      }
     }
     return;
   }
@@ -303,8 +314,8 @@ async function handleEvent(e){
       room.phase  = 'register';
       room.stage  = 'pools';
       room.players = new Map();
-      room.bracket = { round:0, pools:{A:[],B:[],C:[],D:[]}, waitingOdd:null, cross:[] };
-      room.losers = []; room.rankOut = [];
+      room.bracket = { round:0, pools:{A:[],B:[],C:[],D:[]}, waitingOdd:null, cross:[], pos:[], posRound:0 };
+      room.losers = []; room.rankOut = []; room.finalChampion = null;
 
       const announce = [
         `🎌✨  JANKEN TOURNAMENT เปิดฉากแล้ว!! ✨🎌 (กลุ่ม “${gName}”)`,
@@ -366,7 +377,7 @@ async function handleEvent(e){
     case 'simulate': { // janken simulate (16 people incl. you)
       // reset room
       rooms.delete(gid); const r = ensureRoom(gid);
-      r.admin = e.source.userId; r.phase='playing'; r.stage='pools'; r.bracket.round=1; r.losers=[]; r.rankOut=[];
+      r.admin = e.source.userId; r.phase='playing'; r.stage='pools'; r.bracket.round=1; r.losers=[]; r.rankOut=[]; r.finalChampion=null; r.bracket.pos=[]; r.bracket.posRound=0;
       const me = e.source.userId; const meName = displayName;
       r.players.set(me, { name: meName });
       const mocks = Array.from({length:15}, (_,i)=>`mock-${i+1}`);
@@ -395,21 +406,26 @@ async function tryCloseMatch_Pool(gid, room, k, idx){
   const m = room.bracket.pools[k][idx];
   const aH = m.moves[m.a], bH = m.moves[m.b];
 
-  if (m.a && !m.b) { m.winner=m.a; m.loser=null; m.state='done'; await safePush(gid,{type:'text',text:`✅ สาย ${k} — Match ${idx+1}: ${pretty(room,m.a)} ได้สิทธิ์บาย`}); }
-  else if (m.b && !m.a) { m.winner=m.b; m.loser=null; m.state='done'; await safePush(gid,{type:'text',text:`✅ สาย ${k} — Match ${idx+1}: ${pretty(room,m.b)} ได้สิทธิ์บาย`}); }
-  else if (aH && bH){
+  if (m.a && !m.b) {
+    m.winner=m.a; m.loser=null; m.state='done';
+    await safePush(gid, { type:'text', text:`✅ สาย ${k} — Match ${idx+1}: ${pretty(room,m.a)} ได้สิทธิ์บาย` });
+  } else if (m.b && !m.a) {
+    m.winner=m.b; m.loser=null; m.state='done';
+    await safePush(gid, { type:'text', text:`✅ สาย ${k} — Match ${idx+1}: ${pretty(room,m.b)} ได้สิทธิ์บาย` });
+  } else if (aH && bH){
     const r = judge(aH,bH,m.a,m.b);
     if (r==='DRAW'){
       m.moves={}; const gName=await groupName(gid);
       for (const uid of [m.a,m.b]) if (uid && !isBot(uid)) await safePush(uid,[
-        {type:'text',text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`,quickReply:qrPostback(gid,'pools',k,idx)},
-        choiceFlexPostback('เลือกใหม่อีกครั้ง',gid,'pools',k,idx)
+        {type:'text', text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'pools',k,idx)},
+        choiceFlexPostback('เลือกใหม่อีกครั้ง', gid, 'pools', k, idx)
       ]);
       return;
     }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
-    try{ await client.pushMessage(gid,[ flexMatchResult(`สาย ${k} — Match ${idx+1}`, pretty(room,m.a), aH, pretty(room,m.b), bH, pretty(room,m.winner)) ]); }
-    catch{ await safePush(gid,{type:'text',text:`สาย ${k} — Match ${idx+1}\n${pretty(room,m.a)} ${EMOJI[aH]||''} vs ${pretty(room,m.b)} ${EMOJI[bH]||''}\nผู้ชนะ: ${pretty(room,m.winner)}`}); }
+    try{ await client.pushMessage(gid, [ flexMatchResult(`สาย ${k} — Match ${idx+1}`, pretty(room,m.a), aH, pretty(room,m.b), bH, pretty(room,m.winner)) ]); }
+    catch{ await safePush(gid, { type:'text', text:`สาย ${k} — Match ${idx+1}\n${pretty(room,m.a)} ${EMOJI[aH]||''} vs ${pretty(room,m.b)} ${EMOJI[bH]||''}\nผู้ชนะ: ${pretty(room,m.winner)}` }); }
+
     if (m.loser) { room.losers.push(m.loser); room.rankOut.push(m.loser); }
   } else return;
 
@@ -447,16 +463,17 @@ async function tryCloseMatch_Cross(gid, room, idx){
     if (r==='DRAW'){
       m.moves={}; const gName=await groupName(gid);
       for (const uid of [m.a,m.b]) if (uid && !isBot(uid)) await safePush(uid,[
-        {type:'text',text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`,quickReply:qrPostback(gid,'cross',null,idx)},
-        choiceFlexPostback('เลือกใหม่อีกครั้ง',gid,'cross',null,idx)
+        {type:'text', text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'cross',null,idx)},
+        choiceFlexPostback('เลือกใหม่อีกครั้ง', gid, 'cross', null, idx)
       ]);
       return;
     }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
   } else return;
 
-  try{ await client.pushMessage(gid,[ flexMatchResult('ผลรอบรวม', pretty(room,m.a), aH, pretty(room,m.b), bH, pretty(room,m.winner)) ]); }
-  catch{ await safePush(gid,{type:'text',text:`ผลรอบรวม\n${pretty(room,m.a)} ${EMOJI[aH]||''} vs ${pretty(room,m.b)} ${EMOJI[bH]||''}\nผู้ชนะ: ${pretty(room,m.winner)}`}); }
+  try{ await client.pushMessage(gid, [ flexMatchResult('ผลรอบรวม', pretty(room,m.a), aH, pretty(room,m.b), bH, pretty(room,m.winner)) ]); }
+  catch{ await safePush(gid, { type:'text', text:`ผลรอบรวม\n${pretty(room,m.a)} ${EMOJI[aH]||''} vs ${pretty(room,m.b)} ${EMOJI[bH]||''}\nผู้ชนะ: ${pretty(room,m.winner)}` }); }
+
   if (m.loser) { room.losers.push(m.loser); room.rankOut.push(m.loser); }
 
   const done = room.bracket.cross.every(x=>x.state==='done');
@@ -475,7 +492,7 @@ function makePositionPairs(room, champion){
   // เอาคนที่ยังไม่เคยแพ้เลยแต่ไม่ใช่แชมป์ (กรณี bye หรือโครงสร้าง) เติมเข้าไป
   for (const uid of room.players.keys()){
     if (uid===champion) continue;
-    if (!ids.includes(uid) && !isBot(uid)) ids.push(uid);
+    if (!ids.includes(uid)) ids.push(uid);
   }
   // BOT ถ้ามี ให้ไปท้ายสุดเสมอ แต่ยังต้องอยู่ในลิสต์เพื่อจับคู่ถ้ายังเหลือเลขคี่
   const botIndex = ids.indexOf(BOT_UID);
@@ -484,9 +501,12 @@ function makePositionPairs(room, champion){
 }
 
 async function announcePositionRound(gid, room, pairs, roundNo){
+  if (!pairs.length){ await finalizeRanking(gid, room); return; }
   const lines = pairs.map((p,i)=>`Match ${i+1}: ${pretty(room,p[0])} vs ${pretty(room,p[1])}`);
   await tryPushFlexOrText(gid, `🧮 Position Matches — รอบที่ ${roundNo}`, lines);
   const gName = await groupName(gid);
+  // สร้างโครงแมตช์
+  room.bracket.pos = pairs.map(([a,b])=>({ a,b,state:'pending',moves:{},winner:null,loser:null }));
   for (let i=0;i<pairs.length;i++){
     const [a,b]=pairs[i];
     for (const uid of [a,b]) if (uid && !isBot(uid)){
@@ -501,12 +521,14 @@ async function announcePositionRound(gid, room, pairs, roundNo){
 
 async function tryCloseMatch_Position(gid, room, idx){
   const m = room.bracket.pos[idx];
+  if (!m) return;
   const aH = m.moves[m.a], bH = m.moves[m.b];
   if (m.a && !m.b){ m.winner=m.a; m.loser=null; m.state='done'; }
   else if (m.b && !m.a){ m.winner=m.b; m.loser=null; m.state='done'; }
   else if (aH && bH){
     const r = judge(aH,bH,m.a,m.b);
-    if (r==='DRAW'){ m.moves={}; const gName=await groupName(gid);
+    if (r==='DRAW'){
+      m.moves={}; const gName=await groupName(gid);
       for (const uid of [m.a,m.b]) if (uid && !isBot(uid)) await safePush(uid,[ {type:'text',text:`เสมอ — เลือกใหม่ (กลุ่ม “${gName}”)`, quickReply: qrPostback(gid,'pos','-',idx) }, choiceFlexPostback('เลือกใหม่อีกครั้ง', gid,'pos','-',idx) ]);
       return; }
     m.winner = r==='A'? m.a : m.b; m.loser = r==='A'? m.b : m.a; m.state='done';
@@ -515,15 +537,17 @@ async function tryCloseMatch_Position(gid, room, idx){
   try{ await client.pushMessage(gid,[ flexMatchResult('ผล Position', pretty(room,m.a), aH, pretty(room,m.b), bH, pretty(room,m.winner)) ]); }
   catch{ await safePush(gid,{type:'text',text:`ผล Position\n${pretty(room,m.a)} ${EMOJI[aH]||''} vs ${pretty(room,m.b)} ${EMOJI[bH]||''}\nผู้ชนะ: ${pretty(room,m.winner)}`}); }
 
-  if (room.bracket.pos.every(x=>x.state==='done')){
-    // รวมอันดับจากผล Position: ผู้ชนะในชุดแรกจะได้อันดับสูงกว่า
-    const winners = room.bracket.pos.map(m=>m.winner).filter(Boolean);
-    const losers  = room.bracket.pos.map(m=>m.loser).filter(Boolean);
-    room.rankOut.push(...losers); // ผู้แพ้ก่อน
-    room.rankOut.push(...winners);// แล้วค่อยผู้ชนะของรอบนี้
-    // จบ Position ทั้งหมด
-    await finalizeRanking(gid, room);
-  }
+  // ตรวจว่าจบรอบ position นี้หรือยัง
+  const done = room.bracket.pos.every(x=>x.state==='done');
+  if (!done) return;
+
+  // รวมอันดับจากผล Position: ผู้แพ้ก่อน ผู้ชนะทีหลัง เพื่อได้เรียง 3rd..N
+  const winners = room.bracket.pos.map(m=>m.winner).filter(Boolean);
+  const losers  = room.bracket.pos.map(m=>m.loser).filter(Boolean);
+  room.rankOut.push(...losers);
+  room.rankOut.push(...winners);
+
+  await finalizeRanking(gid, room);
 }
 
 /* ===================== FINISH & RANKING ===================== */
@@ -531,14 +555,11 @@ function putBotLast(order){ const idx=order.indexOf(BOT_UID); if (idx>=0){ order
 
 async function finishTournament(gid, room, champion){
   // เมื่อได้แชมป์จาก main bracket → เปิด Position Matches (3rd..N)
-  // สร้างคู่จากผู้แพ้สะสมทั้งหมด + คนที่ยังไม่เคยแพ้ (ยกเว้นแชมป์)
   const posPairs = makePositionPairs(room, champion);
   if (!posPairs.length){ await finalizeRanking(gid, room, champion); return; }
 
-  // เก็บ champion ไว้ก่อน เพื่อวางอันดับ 1 ตอนจบ
   room.finalChampion = champion;
   room.bracket.posRound = 1;
-  room.bracket.pos = posPairs.map(([a,b])=>({ a,b,state:'pending',moves:{},winner:null,loser:null }));
   await announcePositionRound(gid, room, posPairs, room.bracket.posRound);
 }
 
@@ -550,7 +571,9 @@ async function finalizeRanking(gid, room, championParam){
   // อันดับ: 1) champion 2) ผู้ที่ยังไม่เคยแพ้/ค้าง 3) rankOut ตามลำดับ 4) บอทท้ายสุด
   let rank = [champion, ...remain, ...room.rankOut];
   rank = Array.from(new Set(rank)).filter(Boolean);
-  putBotLast(rank);
+  // BOT ท้ายสุดเสมอ
+  const bidx = rank.indexOf(BOT_UID); if (bidx>=0){ rank.splice(bidx,1); rank.push(BOT_UID); }
+
   const lines = rank.map((uid,i)=> `${i+1}. ${pretty(room,uid)}`);
   try{ await client.pushMessage(gid,[ buildFlexRoundPairs('🏁 สรุปอันดับทัวร์นาเมนต์', lines) ]); }
   catch{ await safePush(gid,{type:'text',text:['🏁 สรุปอันดับทัวร์นาเมนต์',...lines].join('\n')}); }
