@@ -52,6 +52,10 @@ const BOT_UID = 'BOT:engine'
 const BOT_NAME = 'BOT 🤖'
 const isBot = (id) => id === BOT_UID
 
+function isRealUserId(id) {
+  return typeof id === 'string' && id.startsWith('U')
+}
+
 const rooms = new Map() // groupId -> room state
 const groupNameCache = new Map()
 
@@ -142,10 +146,19 @@ async function safeReply(token, messages) {
 }
 
 // push many users with stagger
-async function pushBulkStagger(recipients, builder, gap = BASE_DELAY) {
-  for (const uid of recipients) {
-    await safePush(uid, builder(uid))
-    await sleep(gap)
+async function pushBulkStagger(recipients, builder, gap = BASE_DELAY, gid = null, room = null) {
+  const targets = (recipients || []).filter(isRealUserId);   // <<<< กรองผู้รับตรงนี้
+  for (const uid of targets) {
+    try {
+      await safePush(uid, builder(uid));
+    } catch (e) {
+      // แจ้งเตือนในกลุ่มเมื่อส่ง DM ไม่สำเร็จ (ช่วยดีบัก)
+      const code = e?.response?.status;
+      if (gid && code) {
+        await safePush(gid, { type: 'text', text: `❗️ส่ง DM ให้ผู้เล่นบางคนไม่สำเร็จ (code ${code})` });
+      }
+    }
+    await sleep(gap);
   }
 }
 
@@ -256,11 +269,16 @@ async function tryPushFlexOrText(to, title, lines) {
 
 /* ====== DM buttons with POSTBACK (multi-room safe) ====== */
 const matchKey = (gid, stage, pool, idx) => `${gid}|${stage}|${pool ?? '-' }|${idx}`
-const makePostback = (gid, stage, pool, idx, hand) => ({
-  type: 'postback', label: `${EMOJI[hand]} ${hand.toUpperCase()}`,
-  data: `jg|${matchKey(gid, stage, pool, idx)}|${hand}`,
-  displayText: `${hand} (${stage})`
-})
+function makePostback(gid, stage, pool, idx, move) {
+  const map = { rock: ['✊ Rock', 'Rock'], paper: ['✋ Paper', 'Paper'], scissors: ['✌ Scissors', 'Scissors'] }
+  const [label, displayText] = map[move]
+  return {
+    type: 'postback',
+    label,
+    data: `move=${move}&gid=${gid}&stage=${stage}&pool=${pool}&idx=${idx}`,
+    displayText
+  }
+}
 
 const qrPostback = (gid, stage, pool, idx) => ({
   items: HANDS.map(h => ({ type: 'action', action: makePostback(gid, stage, pool, idx, h) }))
@@ -268,18 +286,26 @@ const qrPostback = (gid, stage, pool, idx) => ({
 
 function choiceFlexPostback(title, gid, stage, pool, idx) {
   return {
-    type: 'flex', altText: title,
+    type: 'flex',
+    altText: title || 'เลือกหมัดในการดวล',
     contents: {
       type: 'bubble',
       header: { type: 'box', layout: 'vertical', contents: [{ type: 'text', text: title, weight: 'bold', size: 'lg' }] },
-      body: { type: 'box', layout: 'vertical', spacing: 'md', contents: [
-        { type: 'button', style: 'primary', action: makePostback(gid, stage, pool, idx, 'rock') },
-        { type: 'button', style: 'primary', action: makePostback(gid, stage, pool, idx, 'paper') },
-        { type: 'button', style: 'primary', action: makePostback(gid, stage, pool, idx, 'scissors') },
-      ]},
-      footer: { type: 'box', layout: 'vertical', contents: [
-        { type: 'text', text: '(แตะปุ่มเพื่อเลือกหมัดได้เลย)', size: 'xs', color: '#999' }
-      ]}
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'md',
+        contents: [
+          { type: 'button', style: 'primary', action: makePostback(gid, stage, pool, idx, 'rock'),     color: '#ff6666', height: 'sm' },
+          { type: 'button', style: 'primary', action: makePostback(gid, stage, pool, idx, 'paper'),    color: '#66ccff', height: 'sm' },
+          { type: 'button', style: 'primary', action: makePostback(gid, stage, pool, idx, 'scissors'), color: '#99cc66', height: 'sm' }
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [{ type: 'text', text: '(แตะปุ่มเพื่อเลือกหมัดได้เลย)', size: 'xs', color: '#999' }]
+      }
     }
   }
 }
@@ -337,7 +363,7 @@ async function announcePoolsRound(gid, room, title) {
   for (const k of POOLS) {
     for (let i = 0; i < room.bracket.pools[k].length; i++) {
       const m = room.bracket.pools[k][i]
-      const targets = [m.a, m.b].filter(Boolean)
+      const targets = [m.a, m.b].filter(isRealUserId)
       await pushBulkStagger(targets, () => ([
         { type: 'text', text: `📝 รอบสาย ${k} ของทัวร์ในกลุ่ม “${gName}” — เลือกหมัด (rock/paper/scissors)`, quickReply: qrPostback(gid, 'pools', k, i) },
         choiceFlexPostback('เลือกหมัดสำหรับรอบนี้', gid, 'pools', k, i),
@@ -675,6 +701,11 @@ async function handleEvent(e) {
       if (ids.length % 2 === 1) {
         room.players.set(BOT_UID, { name: BOT_NAME, isBot: true })
         ids.push(BOT_UID)
+      }
+
+      function isRealUserId(id) {
+        // LINE userId จริงจะขึ้นต้นด้วย "U"
+        return typeof id === 'string' && id.startsWith('U');
       }
 
       room.bracket.pools = seedPoolsFrom(ids)
