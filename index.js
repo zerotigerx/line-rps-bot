@@ -126,8 +126,16 @@ async function replyWithRetry(token, messages, attempt = 1) {
   }
 }
 
-async function safePush(to, messages) {
-  try { await pushWithRetry(to, messages) } catch {}
+async function safePush(to, msg) {
+  try {
+    // LINE SDK รับ object เดี่ยว หรือ array (≤ 5 ข้อความ)
+    await client.pushMessage(to, msg);
+  } catch (e) {
+    const code = e?.response?.status;
+    const data = e?.response?.data;   // <<<<< ข้อนี้สำคัญ จะมีข้อความอธิบายสาเหตุ
+    console.error('PUSH_ERROR', { to, code, data, sample: JSON.stringify(msg).slice(0, 400) });
+    throw e;
+  }
 }
 async function safeReply(token, messages) {
   try { await replyWithRetry(token, messages) } catch {}
