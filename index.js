@@ -65,7 +65,7 @@ const shuffle = (a) => {
   }
   return x
 }
-const pretty = (room, uid) => (uid ? room.players.get(uid)?.name || '(?)' : '— Bye —')
+const pretty = (room, uid) => (uid ? (room.players.get(uid)?.name || '(?)') : 'Bot');
 
 const judge = (a, b, aUid = null, bUid = null) => {
   // Human vs BOT: human wins silently
@@ -278,11 +278,32 @@ function choiceFlexPostback(title, gid, stage, pool, idx) {
 
 /* ========== ANNOUNCE HELPERS (Main bracket) ========== */
 const toPairs = ids => { const out = []; for (let i = 0; i < ids.length; i += 2) out.push([ids[i] || null, ids[i + 1] || null]); return out }
+// กระจายคนลงสายเท่าที่จำเป็น (อย่างน้อย 1 สาย)
+// เพื่อเลี่ยงเคส 2 คนถูกแยกคนละสายจนได้บาย
 function seedPoolsFrom(ids) {
-  const pools = { A: [], B: [], C: [], D: [] }, shuffled = shuffle(ids); let i = 0
-  for (const id of shuffled) { pools[POOLS[i % 4]].push(id); i++ }
-  for (const k of POOLS) pools[k] = toPairs(pools[k]).map(([a, b]) => ({ a, b, state: 'pending', moves: {}, winner: null, loser: null }))
-  return pools
+  // เตรียมโครง 4 สายไว้ก่อน กันโค้ดส่วนอื่นอ้าง POOLS ครบชุด
+  const pools = { A: [], B: [], C: [], D: [] };
+
+  // จำนวนสายที่ใช้จริง = min(4, floor(n/2)) อย่างน้อย 1
+  const n = ids.length;
+  const poolCount = Math.max(1, Math.min(4, Math.floor(n / 2))) || 1;
+  const keys = POOLS.slice(0, poolCount);
+
+  const shuffled = shuffle(ids);
+  let i = 0;
+  for (const id of shuffled) {
+    pools[keys[i % keys.length]].push(id);
+    i++;
+  }
+
+  // จับคู่ภายในแต่ละสาย (ถ้าเหลือคี่จะได้ [uid, null] = บาย)
+  for (const k of POOLS) {
+    const pairs = toPairs(pools[k]);
+    pools[k] = pairs.map(([a, b]) => ({
+      a, b, state: 'pending', moves: {}, winner: null, loser: null
+    }));
+  }
+  return pools;
 }
 const allPoolsDone = pools => POOLS.every(k => pools[k].every(m => m.state === 'done'))
 const poolWinners = pools => POOLS.reduce((acc, k) => (acc[k] = pools[k].map(m => m.winner).filter(Boolean), acc), {})
