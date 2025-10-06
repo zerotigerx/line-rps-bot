@@ -64,6 +64,7 @@ function ensureRoom(gid){
       phase:'idle',            // idle | register | playing | finished
       stage:'pools',           // pools | cross | finished
       players:new Map(),       // userId -> {name}
+      simulate:false,          // <<< flag โหมดจำลอง
       bracket:{
         round:0,
         pools:{A:[],B:[],C:[],D:[]}, // match: {a,b,state:'pending'|'done',moves:{},winner,loser}
@@ -184,6 +185,58 @@ function seedPoolsFrom(ids){
 const allPoolsDone = pools => POOLS.every(k => pools[k].every(m => m.state==='done'));
 const poolWinners = pools => POOLS.reduce((acc,k)=> (acc[k] = pools[k].map(m=>m.winner).filter(Boolean), acc), {});
 
+/* ======= (NEW) Simulation helpers ======= */
+// ให้หมัดสองฝั่งไม่ซ้ำแบบแน่ ๆ เพื่อจบแมตช์ในหนึ่งตา
+function randomTwoHandsDifferent() {
+  const hands = ['rock', 'paper', 'scissors'];
+  const a = hands[Math.floor(Math.random() * 3)];
+  const b = hands[(hands.indexOf(a) + 1) % 3];
+  return [a, b];
+}
+// เล่น 1 แมตช์ -> คืน {winner, loser, hA, hB}
+function playMatch(pA, pB) {
+  const [hA, hB] = randomTwoHandsDifferent();
+  const res = judge(hA, hB);
+  const winner = (res === 'A') ? pA : pB;
+  const loser  = (res === 'A') ? pB : pA;
+  return { winner, loser, hA, hB };
+}
+// จัดอันดับภายในกลุ่ม 4 คน -> คืนลิสต์ตำแหน่ง [#1,#2,#3,#4] (เฉพาะใน subset)
+async function placement4(groupId, players, startRank, prettyName) {
+  const s1 = playMatch(players[0], players[1]);
+  const s2 = playMatch(players[2], players[3]);
+  const f  = playMatch(s1.winner, s2.winner);
+  const t  = playMatch(s1.loser , s2.loser );
+  await safePush(groupId, { type:'text',
+    text: `${prettyName}\n${players[0]} vs ${players[1]} → ${s1.winner}\n${players[2]} vs ${players[3]} → ${s2.winner}\nFinal → ${f.winner}\nThird → ${t.winner}`
+  });
+  return [f.winner, f.loser, t.winner, t.loser];
+}
+async function placement8(groupId, players, prettyTitle='Placement 9–16') {
+  const r1 = [
+    playMatch(players[0], players[1]),
+    playMatch(players[2], players[3]),
+    playMatch(players[4], players[5]),
+    playMatch(players[6], players[7]),
+  ];
+  const r1W = r1.map(x => x.winner);
+  const r1L = r1.map(x => x.loser);
+
+  const s1 = playMatch(r1W[0], r1W[1]);
+  const s2 = playMatch(r1W[2], r1W[3]);
+
+  const f  = playMatch(s1.winner, s2.winner);
+  const t  = playMatch(s1.loser , s2.loser );
+
+  const c1 = playMatch(r1L[0], r1L[1]);
+  const c2 = playMatch(r1L[2], r1L[3]);
+  const m5 = playMatch(c1.winner, c2.winner); // 5th-6th (ของ subset)
+  const m7 = playMatch(c1.loser , c2.loser ); // 7th-8th (ของ subset)
+
+  return [f.winner, f.loser, t.winner, t.loser, m5.winner, m5.loser, m7.winner, m7.loser];
+}
+
+/* ======= ANNOUNCE (ปรับ: ข้าม DM เมื่อ simulate) ======= */
 async function announcePoolsRound(gid, room, title){
   const lines=[];
   for (const k of POOLS) {
@@ -192,6 +245,9 @@ async function announcePoolsRound(gid, room, title){
     room.bracket.pools[k].forEach((m,i)=> lines.push(`  Match ${i+1}: ${pretty(room,m.a)} vs ${pretty(room,m.b)}`));
   }
   await tryPushFlexOrText(gid, title, lines);
+
+  // ถ้าเป็นโหมดจำลอง ไม่ต้อง DM
+  if (room.simulate) return;
 
   // DM ปุ่มเลือกหมัด + บอกชื่อกลุ่ม
   const gName = await groupName(gid);
@@ -211,6 +267,8 @@ async function announcePoolsRound(gid, room, title){
 async function announceCrossRound(gid, room, title){
   const lines = room.bracket.cross.map((m,i)=>`Match ${i+1}: ${pretty(room,m.a)} vs ${pretty(room,m.b)}`);
   await tryPushFlexOrText(gid, title, lines);
+
+  if (room.simulate) return;
 
   const gName = await groupName(gid);
   for (const m of room.bracket.cross) for (const uid of [m.a,m.b]) if (uid){
@@ -293,7 +351,6 @@ async function handleEvent(e){
       ]);
       return;
     }
-    // ข้อความ DM แบบพิมพ์เองจะไม่รู้แมตช์ไหนถ้าเล่นหลายกลุ่ม — ให้ผู้ใช้กดปุ่ม postback แทน
     await safeReply(e.replyToken, { type:'text', text:'เพื่อป้องกันสับสนเมื่อคุณเล่นหลายทัวร์พร้อมกัน โปรดแตะปุ่มเลือกหมัดที่ส่งไปให้ (มีชื่อกลุ่มระบุไว้แล้ว) ครับ 🙏' });
     return;
   }
@@ -322,6 +379,7 @@ async function handleEvent(e){
       room.admin  = room.admin || e.source.userId;
       room.phase  = 'register';
       room.stage  = 'pools';
+      room.simulate = false;
       room.players = new Map();
       room.bracket = { round:0, pools:{A:[],B:[],C:[],D:[]}, waitingOdd:null, cross:[] };
 
@@ -364,9 +422,7 @@ async function handleEvent(e){
       room.stage='pools';
 
       await safePush(gid, { type:'text', text:`📣 Match ${room.bracket.round} เริ่มแล้ว (ผู้เล่น ${room.players.size})` });
-
       await announcePoolsRound(gid, room, `📣 Match ${room.bracket.round} เริ่มแล้ว (ผู้เล่น ${room.players.size})`);
-
       await safePush(gid, { type:'text', text:`📩 กรุณาเช็คไลน์ส่วนตัวเพื่อเลือกหมัดดวลกับคู่ต่อสู้ของคุณ (กลุ่ม “${gName}”)` });
       break;
     }
@@ -382,6 +438,98 @@ async function handleEvent(e){
     case 'reset': {
       rooms.delete(gid);
       await safeReply(e.replyToken, { type:'text', text:'♻️ รีเซ็ตแล้ว — janken open เพื่อเริ่มใหม่' });
+      break;
+    }
+
+    /* ====== (NEW) Simulation 16 คน + Placement ครบ 1–16 ====== */
+    case 'simulate': {
+      const requesterId = e.source.userId;
+      let requesterName = 'You';
+      try {
+        const p = await client.getGroupMemberProfile(gid, requesterId);
+        requesterName = p?.displayName || 'You';
+      } catch {}
+
+      // ตั้งค่าห้องให้เป็นโหมดจำลอง (ไม่ DM)
+      room.simulate = true;
+      room.phase = 'playing';
+      room.stage = 'pools';
+
+      // ผู้เล่น 16 คน (รวมคุณ)
+      const players = [ requesterName ];
+      for (let i=1;i<=15;i++) players.push(`Player${i}`);
+      // ถ้าต้องการสุ่มลำดับ จับคู่: uncomment บรรทัดถัดไป
+      // shuffle(players);
+
+      await safePush(gid, { type:'text',
+        text:`🧪 Simulation: Janken 16 คน (กลุ่ม “${await groupName(gid)}”)\nผู้เล่น: ${players.join(', ')}`
+      });
+
+      /* MAIN BRACKET (R16 → QF → SF → Final) */
+      // R16
+      const r16W = [], r16L = [];
+      for (let i=0;i<16;i+=2){
+        const {winner, loser} = playMatch(players[i], players[i+1]);
+        r16W.push(winner); r16L.push(loser);
+      }
+      await safePush(gid, { type:'text', text:`🔹 จบรอบ 16 ทีม\nผู้เข้ารอบ 8: ${r16W.join(', ')}\nตกรอบ (ไปจัดอันดับ 9–16): ${r16L.join(', ')}` });
+
+      // QF
+      const qfW = [], qfL = [];
+      for (let i=0;i<8;i+=2){
+        const {winner, loser} = playMatch(r16W[i], r16W[i+1]);
+        qfW.push(winner); qfL.push(loser);
+      }
+      await safePush(gid, { type:'text', text:`🔹 จบรอบ 8 ทีม\nผู้เข้ารอบรอง: ${qfW.join(', ')}\nตกรอบ (ไปจัดอันดับ 5–8): ${qfL.join(', ')}` });
+
+      // SF
+      const sfW = [], sfL = [];
+      for (let i=0;i<4;i+=2){
+        const {winner, loser} = playMatch(qfW[i], qfW[i+1]);
+        sfW.push(winner); sfL.push(loser);
+      }
+      await safePush(gid, { type:'text', text:`🔹 จบรอบรอง\nผู้เข้าชิง: ${sfW.join(' vs ')}\nผู้แพ้รอบรอง (ไปชิงที่ 3–4): ${sfL.join(' vs ')}` });
+
+      // Final
+      const {winner: champion, loser: runnerUp} = playMatch(sfW[0], sfW[1]);
+      await safePush(gid, { type:'text', text:`🏆 ชิงชนะเลิศ: ${sfW[0]} vs ${sfW[1]} → แชมป์: ${champion}, รอง: ${runnerUp}` });
+
+      /* PLACEMENT BRACKETS */
+      // 3–4
+      const bronze = playMatch(sfL[0], sfL[1]);
+      const third = bronze.winner, fourth = bronze.loser;
+
+      // 5–8 (QF losers)
+      const p5to8 = await placement4(gid, qfL, 5, '🏅 Bracket 5–8');
+      const fifth  = p5to8[0], sixth = p5to8[1], seventh = p5to8[2], eighth = p5to8[3];
+
+      // 9–16 (R16 losers)
+      const p9to16 = await placement8(gid, r16L, '🎖 Bracket 9–16');
+      const [ninth,tenth,eleventh,twelfth, thirteenth,fourteenth,fifteenth,sixteenth] = p9to16;
+
+      // สรุปอันดับ 1–16
+      const table =
+        `1) ${champion}\n`+
+        `2) ${runnerUp}\n`+
+        `3) ${third}\n`+
+        `4) ${fourth}\n`+
+        `5) ${fifth}\n`+
+        `6) ${sixth}\n`+
+        `7) ${seventh}\n`+
+        `8) ${eighth}\n`+
+        `9) ${ninth}\n`+
+        `10) ${tenth}\n`+
+        `11) ${eleventh}\n`+
+        `12) ${twelfth}\n`+
+        `13) ${thirteenth}\n`+
+        `14) ${fourteenth}\n`+
+        `15) ${fifteenth}\n`+
+        `16) ${sixteenth}`;
+
+      await safePush(gid, { type:'text', text:`📊 ผลจัดอันดับครบ 1–16 (Simulation)\n\n${table}` });
+
+      // ปิด flag simulate
+      room.simulate = false;
       break;
     }
 
